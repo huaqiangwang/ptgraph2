@@ -1,0 +1,82 @@
+{
+  "zone": {
+    "function": {
+      "description": "Filter @based begin and @end function symbol, for @repeat times",
+      "begin": {
+        "flags": 3,
+        "targetsym": "xx_begin_addr",
+        "currentip": "xx_begin_ip",
+        "tid": 123
+      },
+      "end": {
+        "flags": 5,
+        "currentip": "xx_end_addr",
+        "targetsym": "xx_end_ip",
+        "tid": 123
+      },
+      "repeat": 0,
+      "repeataccumulated": 0
+    },
+    "time": {
+      "description": "filtering based on timestamp.",
+      "begin": 0,
+      "end": 0
+    },
+    "frame": {
+      "description": "Filter frames based on index begin and count.",
+      "begin": 0,
+      "count": 0
+    }
+  },
+  "skip": {
+    "frontframe": [
+      {
+        "type": "call",
+        "addr": "xx",
+        "ip": "xx"
+      }
+    ],
+    "endfromt": [
+      {
+        "type": "call",
+        "addr": "xx",
+        "ip": "xx"
+      }
+    ]
+  },
+  "modify": {
+    "frontframe": [
+      {
+        "modify": {
+          "sym": "xx",
+          "dso": "xx"
+        },
+        "repace": {
+          "sym": "xx"
+        }
+      }
+    ],
+    "endframe": [
+      {
+        "modify": {
+          "sym": "xx",
+          "dso": "xx"
+        },
+        "repace": {
+          "sym": "xx"
+        }
+      }
+    ],
+    "endframepair": [
+      {
+        "got": "",
+        "wanted": "",
+        "replace": ""
+      }
+    ]
+  },
+  "debug": {
+    "description": "Debug level: off, error, warning, info, debug, trace",
+    "level": "info"
+  }
+}
