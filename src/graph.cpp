@@ -1,16 +1,23 @@
 #include "graph.h"
+#include "perfetto.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
+#include <queue>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 // ============================================================================
 // GraphDrawer Implementation
@@ -36,7 +43,7 @@ GraphDrawer::GraphDrawer(void       *dlfilter_ctx,
     //--------------------------
     // Get parameters from '--dlarg'
     // Support formats:
-    //   --dlarg "-r 0 -n 4 -c id -b 100 -e 200 -j conf.json -f out.dot"
+    //   --dlarg "-r 0 -n 4 -c id -b 100 -e 200 -j conf.json -f out.ftf"
     //   --dlarg -r --dlarg 0 --dlarg -n --dlarg 4
     //   --dlarg -r0 --dlarg -n4
     std::vector<std::string> tokens;
@@ -88,6 +95,10 @@ GraphDrawer::GraphDrawer(void       *dlfilter_ctx,
                 ts_rank_end_ns_ = std::stoull(tokens[++i]);
         } else if (tok.rfind("-e", 0) == 0 && tok.size() > 2) {
             ts_rank_end_ns_ = std::stoull((tok[2] == '=') ? tok.substr(3) : tok.substr(2));
+        } else if (tok == "-P" || tok == "--per-tid-output") {
+            per_tid_output_ = true;
+        } else if (tok == "-v" || tok == "--verbose" || tok == "--debug") {
+            Logger::SetLevel(LogLevel::DEBUG);
         }
     }
 
@@ -238,15 +249,12 @@ void GraphDrawer::AppendFrameWithSymbols(FrameEle           frame,
     AppendFrame(frame);
 }
 
+// Todo: make this function more clear and concise
+// Add debug message to trace if any dlperf sample is not processed
 void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx)
 {
     if (!sample)
         return;
-
-    // Check timeZone filtering
-    if (json_para_.timeZone && !json_para_.timeZone->InRange(sample->time)) {
-        return;
-    }
 
     // Check frameZone filtering
     if (json_para_.frameZone && !json_para_.frameZone->InRange(total_samples_)) {
@@ -260,8 +268,6 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     FrameEle ele{};
     ele.timestamp = sample->time;
     ele.duration  = 0;
-    ele.ip        = sample->ip;
-    ele.caller_ip = sample->addr;
     ele.pid       = sample->pid >= 0 ? static_cast<uint32_t>(sample->pid) : 0;
     ele.tid       = sample->tid >= 0 ? static_cast<uint32_t>(sample->tid) : 0;
     ele.rank      = static_cast<uint32_t>(proc_rank_);
@@ -279,39 +285,80 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         ele.type = FrameType::SAMPLE;
     }
 
-    std::string sym_str;
-    std::string caller_sym_str;
-    std::string dso_str;
+    std::string ip_sym;
+    std::string ip_dso;
+    std::string addr_sym;
+    std::string addr_dso;
+    std::string comm_str;
 
     if (active_ctx) {
         if (perf_dlfilter_fns.resolve_ip) {
             auto al_ip = perf_dlfilter_fns.resolve_ip(active_ctx);
             if (al_ip) {
                 if (al_ip->sym)
-                    sym_str = al_ip->sym;
+                    ip_sym = al_ip->sym;
                 if (al_ip->dso)
-                    dso_str = al_ip->dso;
+                    ip_dso = al_ip->dso;
+                if (al_ip->comm && al_ip->comm[0] != '\0')
+                    comm_str = al_ip->comm;
             }
         }
 
         if (sample->addr_correlates_sym && perf_dlfilter_fns.resolve_addr) {
             auto al_addr = perf_dlfilter_fns.resolve_addr(active_ctx);
-            if (al_addr && al_addr->sym) {
-                caller_sym_str = al_addr->sym;
+            if (al_addr) {
+                if (al_addr->sym)
+                    addr_sym = al_addr->sym;
+                if (al_addr->dso)
+                    addr_dso = al_addr->dso;
             }
         }
     }
 
     // Fallbacks if symbols could not be resolved
-    if (sym_str.empty() && sample->ip) {
+    if (ip_sym.empty() && sample->ip) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(sample->ip));
-        sym_str = buf;
+        ip_sym = buf;
     }
-    if (caller_sym_str.empty() && sample->addr) {
+    if (addr_sym.empty() && sample->addr) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(sample->addr));
-        caller_sym_str = buf;
+        addr_sym = buf;
+    }
+
+    if (comm_str.empty() && ele.pid > 0) {
+        std::ifstream procComm("/proc/" + std::to_string(ele.pid) + "/comm");
+        if (procComm.is_open()) {
+            std::getline(procComm, comm_str);
+        }
+    }
+
+    std::string sym_str;
+    std::string caller_sym_str;
+    std::string dso_str;
+
+    // Distinguish CALL vs RETURN callee/caller roles:
+    // - CALL: destination addr is callee being entered; ip is call site in caller
+    // - RETURN: ip is returning callee; addr is return site in caller
+    if (ele.type == FrameType::CALL) {
+        ele.ip         = sample->addr;
+        ele.caller_ip  = sample->ip;
+        sym_str        = addr_sym;
+        caller_sym_str = ip_sym;
+        dso_str        = addr_dso.empty() ? ip_dso : addr_dso;
+    } else if (ele.type == FrameType::RETURN) {
+        ele.ip         = sample->ip;
+        ele.caller_ip  = sample->addr;
+        sym_str        = ip_sym;
+        caller_sym_str = addr_sym;
+        dso_str        = ip_dso;
+    } else {
+        ele.ip         = sample->ip;
+        ele.caller_ip  = sample->addr;
+        sym_str        = ip_sym;
+        caller_sym_str = addr_sym;
+        dso_str        = ip_dso;
     }
 
     // Check funcZone filtering
@@ -389,6 +436,21 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     }
 
     AppendFrameWithSymbols(ele, sym_str, caller_sym_str, dso_str);
+
+    if (!comm_str.empty()) {
+        auto it = thread_streams_.find(ele.tid);
+        if (it != thread_streams_.end()) {
+            auto *master_hdr = master_zone_.GetMasterHeader();
+            if (master_hdr && it->second.catalog_index < master_hdr->thread_count) {
+                auto *entries = reinterpret_cast<ThreadCatalogEntry *>(
+                    static_cast<char *>(master_zone_.addr) + master_hdr->catalog_offset);
+                if (entries[it->second.catalog_index].comm[0] == '\0') {
+                    std::strncpy(entries[it->second.catalog_index].comm, comm_str.c_str(),
+                                 sizeof(entries[it->second.catalog_index].comm) - 1);
+                }
+            }
+        }
+    }
 }
 
 void GraphDrawer::Finish()
@@ -599,14 +661,629 @@ std::vector<ShmZoneDescriptor> GraphDrawer::CollectAllZonesFromCoordinator(int t
     return all_descs;
 }
 
+// ============================================================================
+// ShmStringResolver Implementation
+// ============================================================================
+
+ShmStringResolver::~ShmStringResolver()
+{
+    for (auto &pair : mapped_zones_) {
+        if (pair.second.addr != MAP_FAILED && pair.second.addr != nullptr) {
+            munmap(pair.second.addr, pair.second.total_size);
+        }
+        if (pair.second.fd >= 0) {
+            close(pair.second.fd);
+        }
+    }
+}
+
+ShmStringResolver::ShmStringResolver(ShmStringResolver &&other) noexcept
+    : mapped_zones_(std::move(other.mapped_zones_)),
+      pools_(std::move(other.pools_))
+{
+}
+
+ShmStringResolver &ShmStringResolver::operator=(ShmStringResolver &&other) noexcept
+{
+    if (this != &other) {
+        for (auto &pair : mapped_zones_) {
+            if (pair.second.addr != MAP_FAILED && pair.second.addr != nullptr) {
+                munmap(pair.second.addr, pair.second.total_size);
+            }
+            if (pair.second.fd >= 0) {
+                close(pair.second.fd);
+            }
+        }
+        mapped_zones_ = std::move(other.mapped_zones_);
+        pools_        = std::move(other.pools_);
+    }
+    return *this;
+}
+
+void ShmStringResolver::AddLocalStringZones(uint32_t rank, const std::vector<ShmZone> &local_zones)
+{
+    for (const auto &sz : local_zones) {
+        auto *hdr = sz.GetStringHeader();
+        if (hdr && sz.string_pool) {
+            uint64_t key = (static_cast<uint64_t>(rank) << 32) | static_cast<uint64_t>(hdr->zone_id);
+            pools_[key]  = {sz.string_pool, hdr->string_size};
+        }
+    }
+}
+
+void ShmStringResolver::LoadFromDescriptors(const std::vector<ShmZoneDescriptor> &descs)
+{
+    for (const auto &desc : descs) {
+        if (desc.type != ShmZoneType::STRING)
+            continue;
+
+        uint64_t key = (static_cast<uint64_t>(desc.rank) << 32) | static_cast<uint64_t>(desc.zone_id);
+        if (pools_.find(key) != pools_.end() || mapped_zones_.find(key) != mapped_zones_.end()) {
+            continue;
+        }
+
+        int fd = shm_open(desc.shm_name, O_RDONLY, 0666);
+        if (fd < 0) {
+            continue;
+        }
+
+        struct stat st{};
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+            close(fd);
+            continue;
+        }
+
+        size_t total_size = static_cast<size_t>(st.st_size);
+        void  *addr       = mmap(nullptr, total_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (addr == MAP_FAILED) {
+            close(fd);
+            continue;
+        }
+
+        auto       *hdr  = reinterpret_cast<const ShmStringZoneHeader *>(addr);
+        const char *pool = static_cast<const char *>(addr) + hdr->string_offset;
+
+        MappedEntry entry{};
+        entry.fd           = fd;
+        entry.addr         = addr;
+        entry.total_size   = total_size;
+        mapped_zones_[key] = entry;
+
+        pools_[key] = {pool, hdr->string_size};
+    }
+}
+
+const char *ShmStringResolver::Resolve(uint32_t rank, const StringRef &ref) const
+{
+    uint64_t key = (static_cast<uint64_t>(rank) << 32) | static_cast<uint64_t>(ref.shmid);
+    auto     it  = pools_.find(key);
+    if (it != pools_.end()) {
+        if (ref.offset < it->second.size) {
+            return it->second.pool + ref.offset;
+        }
+    }
+    return "";
+}
+
+namespace {
+
+    struct StackFrame
+    {
+        uint64_t    timestamp{0};
+        uint64_t    ip{0};
+        uint64_t    caller_ip{0};
+        std::string sym;
+        std::string dso;
+        std::string caller;
+    };
+
+    inline std::string SanitizeSymbol(std::string s)
+    {
+        auto pos = s.find('@');
+        if (pos != std::string::npos) {
+            s.resize(pos);
+        }
+        return s;
+    }
+
+    void ReplayOneThread(uint64_t                              pidtid,
+                         const std::vector<ShmZoneDescriptor> &thread_descs,
+                         const ShmStringResolver              &resolver,
+                         const JsonPara                       &json_para,
+                         bool                                  per_tid_mode,
+                         Perfetto                             *per_tid_writer,
+                         std::vector<TimelineEvent>           &out_events)
+    {
+        std::vector<FrameEle> frames;
+
+        // Load frames from each thread zone
+        for (const auto &desc : thread_descs) {
+            if (desc.element_count == 0)
+                continue;
+
+            int fd = shm_open(desc.shm_name, O_RDONLY, 0666);
+            if (fd < 0) {
+                continue;
+            }
+
+            struct stat st{};
+            if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+                close(fd);
+                continue;
+            }
+
+            void *addr = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+            if (addr == MAP_FAILED) {
+                close(fd);
+                continue;
+            }
+
+            auto       *hdr        = reinterpret_cast<const ShmThreadZoneHeader *>(addr);
+            const auto *frames_ptr = reinterpret_cast<const FrameEle *>(
+                static_cast<const char *>(addr) + hdr->frame_offset);
+
+            uint64_t count = std::min(hdr->frame_count, desc.element_count);
+            for (uint64_t i = 0; i < count; ++i) {
+                frames.push_back(frames_ptr[i]);
+            }
+
+            munmap(addr, st.st_size);
+            close(fd);
+        }
+
+        if (frames.empty())
+            return;
+
+        // Ensure strictly chronological ordering
+        std::sort(frames.begin(), frames.end(), [](const FrameEle &a, const FrameEle &b) {
+            return a.timestamp < b.timestamp;
+        });
+
+        std::vector<StackFrame> stack;
+        uint64_t                last_seen_time = frames.back().timestamp;
+        uint32_t                tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
+
+        uint64_t calls_count          = 0;
+        uint64_t rets_count           = 0;
+        uint64_t exact_match_count    = 0;
+        uint64_t deep_match_count     = 0;
+        uint64_t fallback_match_count = 0;
+        uint64_t empty_rets_count     = 0;
+        uint64_t syscalls_count       = 0;
+        uint64_t tail_pops_count      = 0;
+        size_t   max_depth            = 0;
+
+        for (const auto &ele : frames) {
+            std::string sym_str        = resolver.Resolve(ele.rank, ele.sym);
+            std::string caller_sym_str = resolver.Resolve(ele.rank, ele.caller_sym);
+            std::string dso_str        = resolver.Resolve(ele.rank, ele.dso);
+
+            LOG_DEBUG << "FrameEle: TID " << ele.tid << ", PID " << ele.pid << ", Timestamp " << ele.timestamp
+                      << ", flags " << std::hex << ele.flags << std::dec << ", IP " << caller_sym_str
+                      << ", Addr " << sym_str << std::endl;
+
+            if (sym_str.empty() && ele.ip) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.ip));
+                sym_str = buf;
+            }
+            if (caller_sym_str.empty() && ele.caller_ip) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.caller_ip));
+                caller_sym_str = buf;
+            }
+            if (sym_str.empty())
+                sym_str = "[unknown]";
+            if (caller_sym_str.empty())
+                caller_sym_str = "[unknown]";
+
+            if (ele.type == FrameType::CALL) {
+                calls_count++;
+                sym_str = SanitizeSymbol(sym_str);
+
+                if (json_para.frameFrontSkipping) {
+                    bool skip = false;
+                    for (const auto &rule : *json_para.frameFrontSkipping) {
+                        if (rule && rule->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    if (skip) {
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] Skip CALL frame: " << sym_str << std::endl;
+                        continue;
+                    }
+                }
+
+                if (json_para.frameFrontModification) {
+                    for (const auto &pair : *json_para.frameFrontModification) {
+                        if (pair && pair->first && pair->first->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                            if (pair->second) {
+                                if (pair->second->sym && !pair->second->sym->empty())
+                                    sym_str = *pair->second->sym;
+                                if (pair->second->dso && !pair->second->dso->empty())
+                                    dso_str = *pair->second->dso;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                stack.push_back({ele.timestamp, ele.ip, ele.caller_ip, sym_str, dso_str, caller_sym_str});
+                if (stack.size() > max_depth)
+                    max_depth = stack.size();
+
+                LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] ++PUSH CALL: "
+                          << sym_str << " (caller: " << caller_sym_str << ", ts=" << ele.timestamp
+                          << ", dso=" << dso_str << ")" << std::endl;
+
+                if (per_tid_mode && per_tid_writer) {
+                    per_tid_writer->WriteFrameStart(ele.timestamp, pidtid, std::make_shared<std::string>(sym_str), 0);
+                } else {
+                    out_events.push_back({TimelineEventType::START, ele.timestamp, 0, pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
+                }
+            } else if (ele.type == FrameType::RETURN) {
+                rets_count++;
+                sym_str = SanitizeSymbol(sym_str);
+
+                if (json_para.endFramePair) {
+                    for (const auto &p : *json_para.endFramePair) {
+                        if (p && p->got && p->replace && sym_str == *p->got) {
+                            sym_str = *p->replace;
+                            break;
+                        }
+                    }
+                }
+
+                if (json_para.frameEndSkipping) {
+                    bool skip = false;
+                    for (const auto &rule : *json_para.frameEndSkipping) {
+                        if (rule && rule->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    if (skip) {
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] Skip RET frame: " << sym_str << std::endl;
+                        continue;
+                    }
+                }
+
+                if (json_para.frameEndModification) {
+                    for (const auto &pair : *json_para.frameEndModification) {
+                        if (pair && pair->first && pair->first->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                            if (pair->second) {
+                                if (pair->second->sym && !pair->second->sym->empty())
+                                    sym_str = *pair->second->sym;
+                                if (pair->second->dso && !pair->second->dso->empty())
+                                    dso_str = *pair->second->dso;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                int match_idx = -1;
+                if (!stack.empty() && stack.back().sym == sym_str) {
+                    match_idx = static_cast<int>(stack.size()) - 1;
+                } else {
+                    for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
+                        if (stack[i].sym == sym_str) {
+                            match_idx = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (match_idx >= 0) {
+                    size_t num_popped = stack.size() - match_idx;
+                    if (num_popped == 1) {
+                        exact_match_count++;
+                    } else {
+                        deep_match_count++;
+                    }
+
+                    while (static_cast<int>(stack.size()) > match_idx) {
+                        auto popped = stack.back();
+                        stack.pop_back();
+
+                        uint64_t dur = ele.timestamp >= popped.timestamp ? (ele.timestamp - popped.timestamp) : 0;
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP RET: "
+                                  << popped.sym << " (matched " << sym_str << ", dur=" << dur << " ns)" << std::endl;
+
+                        if (per_tid_mode && per_tid_writer) {
+                            per_tid_writer->WriteFrameEnd(ele.timestamp, pidtid, popped.timestamp,
+                                                          std::make_shared<std::string>(popped.dso),
+                                                          std::make_shared<std::string>(popped.sym), 0);
+                        } else {
+                            out_events.push_back({TimelineEventType::END, ele.timestamp, popped.timestamp,
+                                                  pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
+                        }
+                    }
+                } else if (!stack.empty()) {
+                    // Fallback pop: top frame returned under compiler clone/alias or missing return
+                    fallback_match_count++;
+                    auto popped = stack.back();
+                    stack.pop_back();
+
+                    uint64_t dur = ele.timestamp >= popped.timestamp ? (ele.timestamp - popped.timestamp) : 0;
+                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP RET [FALLBACK]: "
+                              << popped.sym << " (target was " << sym_str << ", dur=" << dur << " ns)" << std::endl;
+
+                    if (per_tid_mode && per_tid_writer) {
+                        per_tid_writer->WriteFrameEnd(ele.timestamp, pidtid, popped.timestamp,
+                                                      std::make_shared<std::string>(popped.dso),
+                                                      std::make_shared<std::string>(popped.sym), 0);
+                    } else {
+                        out_events.push_back({TimelineEventType::END, ele.timestamp, popped.timestamp,
+                                              pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
+                    }
+                } else {
+                    // Stack is empty: function started before trace window
+                    empty_rets_count++;
+                    LOG_DEBUG << "[TID " << tid << "] RET ignored (empty stack, called pre-trace): "
+                              << sym_str << " (ts=" << ele.timestamp << ")" << std::endl;
+                }
+            } else if (ele.type == FrameType::SYSCALL) {
+                syscalls_count++;
+                uint64_t end_time = ele.duration > 0 ? (ele.timestamp + ele.duration) : (ele.timestamp + 100);
+
+                LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] SYSCALL: "
+                          << sym_str << " (dur=" << (end_time - ele.timestamp) << " ns)" << std::endl;
+
+                if (per_tid_mode && per_tid_writer) {
+                    per_tid_writer->WriteFrameFull(ele.timestamp, end_time, pidtid,
+                                                   std::make_shared<std::string>(dso_str),
+                                                   std::make_shared<std::string>(sym_str), 0);
+                } else {
+                    out_events.push_back({TimelineEventType::FULL, end_time, ele.timestamp,
+                                          pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
+                }
+            }
+        }
+
+        // Pop any remaining unreturned frames at stream end
+        while (!stack.empty()) {
+            tail_pops_count++;
+            auto popped = stack.back();
+            stack.pop_back();
+            uint64_t end_time = last_seen_time > popped.timestamp ? last_seen_time : (popped.timestamp + 100);
+
+            LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] Tail pop unclosed frame: "
+                      << popped.sym << " (dur=" << (end_time - popped.timestamp) << " ns)" << std::endl;
+
+            if (per_tid_mode && per_tid_writer) {
+                per_tid_writer->WriteFrameEnd(end_time, pidtid, popped.timestamp,
+                                              std::make_shared<std::string>(popped.dso),
+                                              std::make_shared<std::string>(popped.sym), 0);
+            } else {
+                out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                      pidtid, popped.sym, popped.dso, popped.caller, 0});
+            }
+        }
+
+        LOG_INFO << "[ptgraph] Thread " << tid << " replay summary: " << frames.size() << " frames ("
+                 << calls_count << " calls, " << rets_count << " rets ["
+                 << exact_match_count << " exact, " << deep_match_count << " deep, "
+                 << fallback_match_count << " fallback, " << empty_rets_count << " pre-trace empty], "
+                 << syscalls_count << " syscalls, " << tail_pops_count << " tail pops, max stack depth: "
+                 << max_depth << ")" << std::endl;
+    }
+
+} // namespace
+
+void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::vector<ShmZoneDescriptor> &all_zones)
+{
+    LOG_INFO << "[ptgraph] Generating Perfetto trace into " << outfile
+             << " (mode: " << (GetPerTidOutput() ? "Per-TID separate files" : "Unified single trace") << ")..." << std::endl;
+
+    // 1. Build cross-rank string resolver
+    ShmStringResolver resolver;
+    resolver.AddLocalStringZones(proc_rank_, string_zones_);
+    resolver.LoadFromDescriptors(all_zones);
+
+    // 2. Discover process and thread names from Master zones
+    std::unordered_map<uint32_t, std::string> pid_to_comm;
+    std::unordered_map<uint64_t, std::string> tid_to_comm;
+
+    for (const auto &desc : all_zones) {
+        if (desc.type != ShmZoneType::MASTER)
+            continue;
+
+        int fd = shm_open(desc.shm_name, O_RDONLY, 0666);
+        if (fd < 0)
+            continue;
+
+        struct stat st{};
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            void *addr = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+            if (addr != MAP_FAILED) {
+                auto       *hdr     = reinterpret_cast<const ShmMasterHeader *>(addr);
+                const auto *entries = reinterpret_cast<const ThreadCatalogEntry *>(
+                    static_cast<const char *>(addr) + hdr->catalog_offset);
+                for (uint32_t i = 0; i < hdr->thread_count; ++i) {
+                    if (entries[i].comm[0] != '\0') {
+                        pid_to_comm[entries[i].pid] = entries[i].comm;
+                        uint64_t pt                 = (static_cast<uint64_t>(entries[i].pid) << 32) | entries[i].tid;
+                        tid_to_comm[pt]             = entries[i].comm;
+                    }
+                }
+                munmap(addr, st.st_size);
+            }
+        }
+        close(fd);
+    }
+
+    // 3. Group thread zones by (pid, tid)
+    std::unordered_map<uint64_t, std::vector<ShmZoneDescriptor>> thread_zones_map;
+    std::vector<uint64_t>                                        thread_keys;
+
+    for (const auto &desc : all_zones) {
+        if (desc.type != ShmZoneType::THREAD)
+            continue;
+        uint64_t pidtid = (static_cast<uint64_t>(desc.pid) << 32) | static_cast<uint64_t>(desc.tid);
+        if (thread_zones_map.find(pidtid) == thread_zones_map.end()) {
+            thread_keys.push_back(pidtid);
+        }
+        thread_zones_map[pidtid].push_back(desc);
+    }
+
+    // Sort zone descriptors for each thread by (rank, zone_id)
+    for (auto &pair : thread_zones_map) {
+        std::sort(pair.second.begin(), pair.second.end(), [](const ShmZoneDescriptor &a, const ShmZoneDescriptor &b) {
+            if (a.rank != b.rank)
+                return a.rank < b.rank;
+            return a.zone_id < b.zone_id;
+        });
+    }
+
+    // Ensure fallback process and thread names for any missing
+    for (uint64_t pidtid : thread_keys) {
+        uint32_t pid = static_cast<uint32_t>(pidtid >> 32);
+        uint32_t tid = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
+
+        if (pid_to_comm.find(pid) == pid_to_comm.end() || pid_to_comm[pid].empty()) {
+            std::string   pcomm;
+            std::ifstream procComm("/proc/" + std::to_string(pid) + "/comm");
+            if (procComm.is_open()) {
+                std::getline(procComm, pcomm);
+            }
+            if (pcomm.empty()) {
+                pcomm = "pid_" + std::to_string(pid);
+            }
+            pid_to_comm[pid] = pcomm;
+        }
+
+        if (tid_to_comm.find(pidtid) == tid_to_comm.end() || tid_to_comm[pidtid].empty()) {
+            tid_to_comm[pidtid] = pid_to_comm[pid].empty() ? ("thread_" + std::to_string(tid)) : pid_to_comm[pid];
+        }
+    }
+
+    bool   is_per_tid = GetPerTidOutput();
+    size_t num_tids   = thread_keys.size();
+
+    LOG_INFO << "[ptgraph] Replaying timelines for " << num_tids << " threads concurrently..." << std::endl;
+
+    unsigned int num_workers = std::thread::hardware_concurrency();
+    if (num_workers == 0)
+        num_workers = 4;
+    num_workers = std::min(num_workers, static_cast<unsigned int>(num_tids));
+    if (num_workers == 0)
+        num_workers = 1;
+
+    std::vector<std::vector<TimelineEvent>> per_thread_results(num_tids);
+    std::atomic<size_t>                     next_thread_idx{0};
+    std::vector<std::thread>                workers;
+
+    for (unsigned int w = 0; w < num_workers; ++w) {
+        workers.emplace_back([&]() {
+            while (true) {
+                size_t idx = next_thread_idx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= num_tids)
+                    break;
+
+                uint64_t pidtid = thread_keys[idx];
+                uint32_t pid    = static_cast<uint32_t>(pidtid >> 32);
+                uint32_t tid    = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
+
+                std::unique_ptr<Perfetto> per_tid_writer = nullptr;
+                if (is_per_tid) {
+                    std::string fname = "out_tid_" + std::to_string(tid) + ".ftf";
+                    per_tid_writer    = std::make_unique<Perfetto>(fname);
+                    std::string pcomm = pid_to_comm[pid];
+                    std::string tcomm = tid_to_comm[pidtid];
+                    per_tid_writer->WriteProcessRecord(pid, std::make_shared<std::string>(pcomm));
+                    per_tid_writer->WriteThreadNameRecord(pid, tid, std::make_shared<std::string>(tcomm));
+                }
+
+                ReplayOneThread(pidtid, thread_zones_map[pidtid], resolver, json_para_,
+                                is_per_tid, per_tid_writer.get(), per_thread_results[idx]);
+
+                if (per_tid_writer) {
+                    per_tid_writer->Flush();
+                }
+            }
+        });
+    }
+
+    for (auto &t : workers) {
+        t.join();
+    }
+
+    if (is_per_tid) {
+        LOG_INFO << "[ptgraph] Per-TID Perfetto trace files generated successfully for "
+                 << num_tids << " threads." << std::endl;
+        return;
+    }
+
+    // 4. In unified mode: serialize all buffered events chronologically into outfile
+    LOG_INFO << "[ptgraph] Serializing unified trace into " << outfile << "..." << std::endl;
+    Perfetto unified(outfile);
+
+    for (const auto &pair : pid_to_comm) {
+        unified.WriteProcessRecord(pair.first, std::make_shared<std::string>(pair.second));
+    }
+    for (const auto &pair : tid_to_comm) {
+        uint32_t p = static_cast<uint32_t>(pair.first >> 32);
+        uint32_t t = static_cast<uint32_t>(pair.first & 0xFFFFFFFFULL);
+        unified.WriteThreadNameRecord(p, t, std::make_shared<std::string>(pair.second));
+    }
+
+    struct QueueItem
+    {
+        uint64_t timestamp;
+        size_t   tid_idx;
+        size_t   event_idx;
+
+        bool operator>(const QueueItem &other) const
+        {
+            return timestamp > other.timestamp;
+        }
+    };
+
+    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+    for (size_t i = 0; i < num_tids; ++i) {
+        if (!per_thread_results[i].empty()) {
+            pq.push({per_thread_results[i][0].timestamp, i, 0});
+        }
+    }
+
+    uint64_t total_events_written = 0;
+    while (!pq.empty()) {
+        auto top = pq.top();
+        pq.pop();
+
+        const auto &ev = per_thread_results[top.tid_idx][top.event_idx];
+        if (ev.type == TimelineEventType::START) {
+            unified.WriteFrameStart(ev.timestamp, ev.pidtid, std::make_shared<std::string>(ev.sym), 0);
+        } else if (ev.type == TimelineEventType::END) {
+            unified.WriteFrameEnd(ev.timestamp, ev.pidtid, ev.start_timestamp,
+                                  std::make_shared<std::string>(ev.dso),
+                                  std::make_shared<std::string>(ev.sym), 0);
+        } else if (ev.type == TimelineEventType::FULL) {
+            unified.WriteFrameFull(ev.start_timestamp, ev.timestamp, ev.pidtid,
+                                   std::make_shared<std::string>(ev.dso),
+                                   std::make_shared<std::string>(ev.sym), 0);
+        }
+        total_events_written++;
+
+        if (top.event_idx + 1 < per_thread_results[top.tid_idx].size()) {
+            pq.push({per_thread_results[top.tid_idx][top.event_idx + 1].timestamp,
+                     top.tid_idx, top.event_idx + 1});
+        }
+    }
+
+    unified.Flush();
+    LOG_INFO << "[ptgraph] Unified Perfetto trace written to " << outfile
+             << " (" << total_events_written << " events across " << num_tids << " threads)." << std::endl;
+}
+
 void GraphDrawer::GenerateGraph(const std::string &outfile, const std::vector<ShmZoneDescriptor> &gathered_zones)
 {
     std::string target_file = outfile.empty() ? outfilename_ : outfile;
     if (target_file.empty()) {
-        target_file = "callgraph.dot";
+        target_file = "out.ftf";
     }
-
-    LOG_INFO << "[ptgraph] Generating call graph into " << target_file << "..." << std::endl;
 
     std::vector<ShmZoneDescriptor> all_zones = gathered_zones;
     if (all_zones.empty()) {
@@ -617,24 +1294,7 @@ void GraphDrawer::GenerateGraph(const std::string &outfile, const std::vector<Sh
         }
     }
 
-    uint64_t total_frames = 0;
-    for (const auto &desc : all_zones) {
-        if (desc.type == ShmZoneType::THREAD) {
-            total_frames += desc.element_count;
-        }
-    }
-
-    std::ofstream out(target_file);
-    if (out.is_open()) {
-        out << "digraph CallGraph {\n";
-        out << "  node [shape=box];\n";
-        out << "  // Total frames: " << total_frames << "\n";
-        out << "}\n";
-        out.close();
-    }
-
-    LOG_INFO << "[ptgraph] Call graph generation complete into " << target_file
-             << ". Total frames processed: " << total_frames << std::endl;
+    GeneratePerfettoTrace(target_file, all_zones);
 }
 
 const char *GraphDrawer::ResolveString(const ShmZone &zone, uint64_t offset)
@@ -836,6 +1496,7 @@ void GraphDrawer::RegisterThreadInMaster(ThreadStream &stream)
     entries[current_threads].active_zone_id = stream.current_zone_id;
     entries[current_threads].is_terminated  = 0;
     entries[current_threads].total_frames   = 0;
+    std::memset(entries[current_threads].comm, 0, sizeof(entries[current_threads].comm));
 
     stream.catalog_index = current_threads;
     __atomic_store_n(&master_hdr->thread_count, current_threads + 1, __ATOMIC_RELEASE);

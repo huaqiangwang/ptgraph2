@@ -208,7 +208,36 @@ int main()
         std::cout << "[TEST] Total frames aggregated: " << total_frames << " (expected 10)" << std::endl;
         assert(total_frames == 10 && "Expected 2 + 4 + 4 = 10 frames");
 
-        main_drawer.GenerateGraph("test_callgraph.dot");
+        // Test Perfetto unified trace generation
+        std::string test_ftf = "test_unified.ftf";
+        main_drawer.GenerateGraph(test_ftf, all_collected);
+
+        std::ifstream ftf_file(test_ftf, std::ios::binary);
+        assert(ftf_file.is_open() && "Expected test_unified.ftf to exist");
+        uint64_t magic = 0;
+        ftf_file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+        assert(magic == 0x0016547846040010LL && "Expected valid Fuchsia trace header magic");
+        ftf_file.close();
+        std::remove(test_ftf.c_str());
+        std::cout << "[TEST] Unified Perfetto trace test passed!" << std::endl;
+
+        // Test Per-TID Perfetto trace generation
+        main_drawer.SetPerTidOutput(true);
+        main_drawer.GenerateGraph("out.ftf", all_collected);
+        main_drawer.SetPerTidOutput(false);
+
+        // Verify out_tid_4000.ftf, out_tid_4001.ftf, out_tid_4002.ftf
+        for (uint32_t tid : {4000, 4001, 4002}) {
+            std::string   tid_file = "out_tid_" + std::to_string(tid) + ".ftf";
+            std::ifstream tf(tid_file, std::ios::binary);
+            assert(tf.is_open() && "Expected per-tid file to exist");
+            uint64_t tid_magic = 0;
+            tf.read(reinterpret_cast<char *>(&tid_magic), sizeof(tid_magic));
+            assert(tid_magic == 0x0016547846040010LL && "Expected valid Fuchsia trace header in per-tid file");
+            tf.close();
+            std::remove(tid_file.c_str());
+        }
+        std::cout << "[TEST] Per-TID Perfetto trace test passed!" << std::endl;
     }
 
     // Clean up
@@ -218,7 +247,6 @@ int main()
         PtGraphReader::UnlinkAll(multi_prefix + "_rank_" + std::to_string(r));
     }
     PtGraphReader::UnlinkAll(multi_prefix);
-    std::remove("test_callgraph.dot");
 
     std::cout << "[TEST] Multi-process Coordinator test passed successfully!" << std::endl;
     return 0;

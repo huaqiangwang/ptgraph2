@@ -11,6 +11,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(SOURCES
     src/dlfilter.cpp
     src/graph.cpp
+    src/perfetto.cpp
 )
 
 add_library(ptgraph SHARED ${SOURCES})
@@ -39,7 +40,7 @@ target_compile_options(ptgraph PRIVATE
 )
 
 # mperf parallel multi-process launcher
-add_executable(mperf src/mperf.cpp src/graph.cpp)
+add_executable(mperf src/mperf.cpp src/graph.cpp src/perfetto.cpp)
 target_include_directories(mperf PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -53,7 +54,7 @@ target_compile_options(mperf PRIVATE
     -Wextra
 )
 
-add_executable(test_shm test/test_shm.cpp src/graph.cpp)
+add_executable(test_shm test/test_shm.cpp src/graph.cpp src/perfetto.cpp)
 target_include_directories(test_shm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -67,7 +68,7 @@ target_compile_options(test_shm PRIVATE
     -Wextra
 )
 
-add_executable(test_json test/test_json.cpp src/graph.cpp)
+add_executable(test_json test/test_json.cpp src/graph.cpp src/perfetto.cpp)
 target_include_directories(test_json PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )

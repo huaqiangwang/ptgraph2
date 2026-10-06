@@ -104,7 +104,9 @@ void PrintUsage(const char *prog)
               << "  -i <perf.data>    Input perf data file (default: perf.data)\n"
               << "  -n <num>          Number of parallel perf script worker processes (default: 4)\n"
               << "  -j <config.json>  Configuration JSON file\n"
-              << "  -f <output.dot>   Output callgraph file (default: callgraph.dot)\n"
+              << "  -f <output.ftf>   Output timeline / callgraph file (default: out.ftf)\n"
+              << "  -P                Enable per-TID Perfetto output files (out_tid_<tid>.ftf)\n"
+              << "  -v                Enable verbose / debug logging\n"
               << "  -s <dlfilter.so>  Path to libptgraph.so filter library\n"
               << "  -b <begin_ns>     Explicit global begin timestamp (nanoseconds)\n"
               << "  -e <end_ns>       Explicit global end timestamp (nanoseconds)\n"
@@ -113,16 +115,18 @@ void PrintUsage(const char *prog)
 
 int main(int argc, char **argv)
 {
-    std::string perf_data = "perf.data";
-    int         num_procs = 4;
-    std::string json_conf = "";
-    std::string out_file  = "callgraph.dot";
-    std::string dlfilter  = "build/lib/libptgraph.so";
-    uint64_t    begin_ns  = 0;
-    uint64_t    end_ns    = 0;
+    std::string perf_data      = "perf.data";
+    int         num_procs      = 4;
+    std::string json_conf      = "";
+    std::string out_file       = "out.ftf";
+    std::string dlfilter       = "build/lib/libptgraph.so";
+    bool        per_tid_output = false;
+    bool        verbose        = false;
+    uint64_t    begin_ns       = 0;
+    uint64_t    end_ns         = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:n:j:f:s:b:e:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:n:j:f:Pvs:b:e:h")) != -1) {
         switch (opt) {
         case 'i':
             perf_data = optarg;
@@ -135,6 +139,13 @@ int main(int argc, char **argv)
             break;
         case 'f':
             out_file = optarg;
+            break;
+        case 'P':
+            per_tid_output = true;
+            break;
+        case 'v':
+            verbose = true;
+            Logger::SetLevel(LogLevel::DEBUG);
             break;
         case 's':
             dlfilter = optarg;
@@ -243,6 +254,12 @@ int main(int argc, char **argv)
             }
             if (!out_file.empty()) {
                 dlarg_str += " -f " + out_file;
+            }
+            if (per_tid_output) {
+                dlarg_str += " -P";
+            }
+            if (verbose) {
+                dlarg_str += " -v";
             }
             if (r_begin > 0 && r_end > r_begin) {
                 dlarg_str += " -b " + std::to_string(r_begin) + " -e " + std::to_string(r_end);

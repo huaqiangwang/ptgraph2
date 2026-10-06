@@ -281,6 +281,8 @@ struct JsonPara
     std::shared_ptr<std::vector<std::shared_ptr<FrontFrame>>> frameFrontSkipping;
     std::shared_ptr<std::vector<std::shared_ptr<EndFrame>>>   frameEndSkipping;
 
+    bool perTidOutput{false};
+
     LogLevel debugLevel = LogLevel::INFO;
 
     bool HasFuncZone() const { return funcZone != nullptr; }
@@ -491,6 +493,11 @@ struct JsonPara
                 }
             }
 
+            // Per-TID Perfetto output option
+            if (json_conf.contains("perTidOutput")) {
+                perTidOutput = json_conf["perTidOutput"].get<bool>();
+            }
+
         } catch (const nlohmann::json::parse_error &e) {
             std::cerr << "JSON parse error: " << e.what() << std::endl;
             clear();
@@ -515,6 +522,7 @@ struct JsonPara
         frameFrontSkipping     = nullptr;
         frameEndSkipping       = nullptr;
         endFramePair           = nullptr;
+        perTidOutput           = false;
         debugLevel             = LogLevel::INFO;
         Logger::SetLevel(LogLevel::INFO);
     }

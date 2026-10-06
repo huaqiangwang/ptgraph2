@@ -43,6 +43,7 @@ struct alignas(8) ThreadCatalogEntry
     uint32_t active_zone_id{0}; // Current / latest zone ID written for this thread
     uint32_t is_terminated{0};  // 1 if thread has finished or filter stopped
     uint64_t total_frames{0};   // Cumulative frames written across all zones for this thread
+    char     comm[16]{0};       // Process/thread command name
 };
 
 //
