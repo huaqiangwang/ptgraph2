@@ -83,6 +83,7 @@ public:
     void            LoadConfig(const std::string &conf_file);
     const JsonPara &GetJsonPara() const { return json_para_; }
     JsonPara       &GetJsonPara() { return json_para_; }
+    int             FilterByTimestamp(uint64_t timestamp);
 
     const std::string &GetShmPrefix() const { return shm_prefix_; }
     size_t             GetFrameCapacity() const { return frame_capacity_; }
@@ -142,10 +143,15 @@ private:
     size_t      string_capacity_;
     size_t      max_threads_;
     uint32_t    current_string_zone_id_{0};
-    uint32_t    mpi_rank_{0};
-    uint32_t    mpi_size_{1};
+    int         mpi_rank_{0};
+    int         mpi_size_{1};
     bool        unlink_on_destroy_{false};
     bool        is_finished_{false};
+    std::string outfilename_;
+    uint64_t    ts_global_begin_ns_{0};
+    uint64_t    ts_global_end_ns_{0};
+    uint64_t    ts_rank_begin_ns_{0};
+    uint64_t    ts_rank_end_ns_{0};
 
     JsonPara json_para_;
     uint64_t total_samples_{0};
@@ -199,4 +205,3 @@ private:
 };
 
 #endif // __GRAPH_H__
-

@@ -43,19 +43,39 @@ GraphDrawer::GraphDrawer(void       *dlfilter_ctx,
     CreateMasterZone();
     CreateNewStringZone();
 
-    // Parse options from perf --dlarg if available
-    if (ctx_ && perf_dlfilter_fns.args) {
-        int    argc = 0;
-        char **argv = perf_dlfilter_fns.args(ctx_, &argc);
-        for (int i = 0; i < argc; ++i) {
-            if (!argv[i])
-                continue;
-            std::string arg = argv[i];
-            if (arg.rfind("conf=", 0) == 0) {
-                LoadConfig(arg.substr(5));
-            }
+    int    argc = 0;
+    char **argv = perf_dlfilter_fns.args(ctx_, &argc);
+
+    //--------------------------
+    // Get parameter from '--dlarg'
+    // parameter usage:
+    // -f <filename> : specify output filename
+    // -j <json>    : specify JSON configuration file
+    std::regex re_remove_space(R"(^\s+|\s+$)");
+    std::regex re_split_cmdfiled(R"(\s*(-[fj]+)\s+([^\s]+)\s*)");
+
+    std::cmatch matches;
+    auto        argList = std::vector<std::pair<std::string, std::string>>{};
+    for (int i = 0; i < argc; i++) {
+        // remove any tailing and leading empty space
+        auto str = std::string(argv[i]);
+        str      = std::regex_replace(str, re_remove_space, "");
+        auto m   = std::regex_match(argv[i], matches, re_split_cmdfiled);
+        if (m) {
+            argList.push_back({matches[1], matches[2]});
         }
     }
+    for (auto it = argList.cbegin(); it != argList.cend(); ++it) {
+        const std::string &argf   = it->first;
+        auto               argstr = it->second;
+        if (argf == "-f") {
+            outfilename_ = argstr;
+        } else if (argf == "-j") {
+            auto conf = argstr;
+            LoadConfig(conf);
+        }
+    }
+    //--------------------------
 }
 
 GraphDrawer::~GraphDrawer()
@@ -69,6 +89,37 @@ GraphDrawer::~GraphDrawer()
 void GraphDrawer::LoadConfig(const std::string &conf_file)
 {
     json_para_.Parse(conf_file.c_str());
+    ts_global_begin_ns_ = json_para_.timeZone->begin;
+    ts_global_end_ns_   = json_para_.timeZone->end;
+
+    if (ts_global_begin_ns_ >= ts_global_end_ns_) {
+        LOG_WARNING << "Invalid time zone, TimeZone failed: ts_global_begin_ns_"
+                    << ts_global_begin_ns_ << " >= ts_global_end_ns_" << ts_global_end_ns_ << std::endl;
+        ts_global_begin_ns_ = 0;
+        ts_global_end_ns_   = 0;
+    }
+
+    auto ts_span_ns = ts_global_end_ns_ - ts_global_begin_ns_;
+
+    ts_rank_begin_ns_ = ts_global_begin_ns_ + ts_span_ns * mpi_rank_ / mpi_size_;
+    ts_rank_end_ns_   = ts_global_begin_ns_ + ts_span_ns * (mpi_rank_ + 1) / mpi_size_;
+}
+
+// Return 0: sample will be passed to `filter_event`
+// Return 1: sample is beyond the rank's time zone and should be filtered out
+// Return -38: ENOSYS. stop processing further samples
+int GraphDrawer::FilterByTimestamp(uint64_t timestamp)
+{
+    if (ts_rank_begin_ns_ == 0 && ts_rank_end_ns_ == 0) {
+        return 0;
+    }
+
+    if (timestamp < ts_rank_begin_ns_) {
+        return 1;
+    } else if (timestamp >= ts_rank_end_ns_) {
+        return -ENOSYS;
+    }
+    return 0;
 }
 
 StringRef GraphDrawer::AppendString(const std::string &str)

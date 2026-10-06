@@ -13,6 +13,10 @@ static bool g_mpi_initialized_by_filter = false;
 
 int start(void **data, void *ctx)
 {
+    // Initialize GraphDrawer and manage ctx
+    auto drawer = new GraphDrawer(ctx);
+    *data       = static_cast<void *>(drawer);
+
 #if defined(PTGRAPH_HAS_MPI)
     int mpi_inited = 0;
     MPI_Initialized(&mpi_inited);
@@ -21,14 +25,15 @@ int start(void **data, void *ctx)
         char **argv = nullptr;
         if (MPI_Init(&argc, &argv) == MPI_SUCCESS) {
             g_mpi_initialized_by_filter = true;
+            int rank;
+            int size;
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &size);
+            drawer->SetMpiRank(rank);
+            drawer->SetMpiSize(size);
         }
     }
 #endif
-
-    // Initialize GraphDrawer and manage ctx
-    auto drawer = new GraphDrawer(ctx);
-    *data       = static_cast<void *>(drawer);
-
     LOG_INFO << "[ptgraph " << getpid() << "] Starting filter" << std::endl;
 
     return 0;
@@ -81,17 +86,12 @@ int filter_event_early(void *raw_state, const struct perf_dlfilter_sample *sampl
         return 0;
     }
 
-    const auto &para = drawer->GetJsonPara();
-
-    // Time zone filtering
-    if (para.timeZone) {
-        if (para.timeZone->end != 0 && sample->time > para.timeZone->end) {
-            return -38; // Reached end of time zone -> stop processing
-        }
-        if (para.timeZone->begin != 0 && sample->time < para.timeZone->begin) {
-            return 1; // Before time zone begin -> skip event
-        }
+    auto ret = drawer->FilterByTimestamp(sample->time);
+    if (ret != 0) {
+        return ret;
     }
+
+    const auto &para = drawer->GetJsonPara();
 
     // Function zone: if enough accumulated functions captured across threads, stop early
     if (para.funcZone && para.funcZone->IsEnoughAccumulatedFunctions()) {
