@@ -44,7 +44,10 @@ GraphDrawer::GraphDrawer(void       *dlfilter_ctx,
     CreateNewStringZone();
 
     int    argc = 0;
-    char **argv = perf_dlfilter_fns.args(ctx_, &argc);
+    char **argv = nullptr;
+    if (ctx_ && perf_dlfilter_fns.args) {
+        argv = perf_dlfilter_fns.args(ctx_, &argc);
+    }
 
     //--------------------------
     // Get parameter from '--dlarg'
@@ -194,6 +197,7 @@ void GraphDrawer::AppendFrame(FrameEle frame)
 
     __atomic_store_n(&hdr->frame_count, idx + 1, __ATOMIC_RELEASE);
 
+    inserted_frames_count_++;
     UpdateMasterTotalFrames(stream);
 }
 

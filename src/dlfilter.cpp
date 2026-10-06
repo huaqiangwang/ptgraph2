@@ -44,6 +44,11 @@ int stop(void *raw_state, [[maybe_unused]] void *ctx)
     auto drawer = static_cast<GraphDrawer *>(raw_state);
 
     if (drawer) {
+        LOG_INFO << "[ptgraph rank " << drawer->GetMpiRank() << "] Stats: "
+                 << "early_samples=" << drawer->GetEarlySamples()
+                 << ", filtered_samples=" << drawer->GetFilteredSamples()
+                 << ", inserted_frames=" << drawer->GetInsertedFrames()
+                 << std::endl;
 
 #if defined(PTGRAPH_HAS_MPI)
         int mpi_inited = 0;
@@ -52,12 +57,23 @@ int stop(void *raw_state, [[maybe_unused]] void *ctx)
             // Gather all SHM zone descriptors (Frames and symbols zones) from all MPI processes
             auto gathered_zones = drawer->GatherShmZonesMpi();
 
+            // Calculate total frames across all gathered zones
+            uint64_t total_gathered_frames = 0;
+            for (const auto &desc : gathered_zones) {
+                if (desc.type == ShmZoneType::THREAD) {
+                    total_gathered_frames += desc.element_count;
+                }
+            }
+
             // At rank 0 or for diagnostic output / downstream handoff:
             if (drawer->GetMpiRank() == 0) {
                 std::fprintf(stderr,
-                             "[ptgraph dlfilter] MPI gathered %zu SHM zones across %u ranks\n",
+                             "[ptgraph dlfilter] MPI gathered %zu SHM zones across %u ranks, total frames inserted: %lu\n",
                              gathered_zones.size(),
-                             drawer->GetMpiSize());
+                             drawer->GetMpiSize(),
+                             (unsigned long)total_gathered_frames);
+                LOG_INFO << "[ptgraph dlfilter] MPI total frames inserted across all ranks: "
+                         << total_gathered_frames << std::endl;
             }
 
             MPI_Barrier(MPI_COMM_WORLD);
@@ -86,6 +102,8 @@ int filter_event_early(void *raw_state, const struct perf_dlfilter_sample *sampl
         return 0;
     }
 
+    drawer->IncEarlySamples();
+
     auto ret = drawer->FilterByTimestamp(sample->time);
     if (ret != 0) {
         return ret;
@@ -107,6 +125,8 @@ int filter_event(void *raw_state, const struct perf_dlfilter_sample *sample, voi
     if (!drawer || !sample) {
         return 0;
     }
+
+    drawer->IncFilteredSamples();
 
     // Add perf_dlfilter_sample into Frame / SHM.
     // If the active SHM zone capacity (frame queue or string pool) is full,

@@ -107,6 +107,15 @@ public:
     // Mark all threads and master catalog as finished
     void Finish();
 
+    // Statistics tracking
+    void     IncEarlySamples() { early_samples_count_++; }
+    uint64_t GetEarlySamples() const { return early_samples_count_; }
+
+    void     IncFilteredSamples() { filtered_samples_count_++; }
+    uint64_t GetFilteredSamples() const { return filtered_samples_count_; }
+
+    uint64_t GetInsertedFrames() const { return inserted_frames_count_; }
+
     // Unlink all SHM segments created by this instance from /dev/shm
     void UnlinkAll();
 
@@ -155,6 +164,9 @@ private:
 
     JsonPara json_para_;
     uint64_t total_samples_{0};
+    uint64_t early_samples_count_{0};
+    uint64_t filtered_samples_count_{0};
+    uint64_t inserted_frames_count_{0};
 
     ShmZone                                    master_zone_;
     std::vector<ShmZone>                       string_zones_;
