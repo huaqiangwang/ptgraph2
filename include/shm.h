@@ -46,7 +46,7 @@ struct alignas(8) ThreadCatalogEntry
 };
 
 //
-// Descriptor representing a single SHM zone published by an MPI rank
+// Descriptor representing a single SHM zone published by a worker process/rank
 //
 enum class ShmZoneType : uint8_t
 {
@@ -58,21 +58,61 @@ enum class ShmZoneType : uint8_t
 #pragma pack(push, 8)
 struct alignas(8) ShmZoneDescriptor
 {
-    uint32_t    rank{0};                   // Originating MPI rank
+    uint32_t    rank{0};                   // Worker rank / process ID index
     uint32_t    pid{0};                    // Process ID
     uint32_t    tid{0};                    // Thread ID (for thread frame zones)
     uint32_t    zone_id{0};                // Zone ID
     ShmZoneType type{ShmZoneType::THREAD}; // Master, String, or Thread zone
     uint8_t     is_full{0};
-    uint16_t    reserved{0};
+    uint8_t     reserved[3]{0};
     uint64_t    element_count{0}; // frame_count or string_size
     uint64_t    capacity{0};      // frame_capacity or string_capacity
     char        shm_name[128]{0}; // Name in /dev/shm (e.g. "/ptgraph_tid_1001_zone_0")
 };
+
+enum class WorkerState : uint32_t
+{
+    INIT       = 0,
+    PROCESSING = 1,
+    COMPLETED  = 2,
+    FAILED     = 3
+};
+
+constexpr size_t MAX_RANKS          = 128;
+constexpr size_t MAX_ZONES_PER_RANK = 256;
+
+// Each worker writes its finished zone list and stats here
+struct alignas(8) RankCoordSlot
+{
+    uint32_t          status{0};       // WorkerState (atomic)
+    uint32_t          rank{0};         // Rank ID
+    uint32_t          pid{0};          // Process PID
+    uint32_t          zone_count{0};   // Number of zones published in zones[]
+    uint64_t          total_frames{0}; // Total frames inserted by this rank
+    uint64_t          early_samples{0};
+    uint64_t          filtered_samples{0};
+    ShmZoneDescriptor zones[MAX_ZONES_PER_RANK];
+};
+
+// Coordinator header mapped at "/<prefix>_coord_<coord_id>"
+struct alignas(8) ShmCoordinator
+{
+    uint32_t      magic;       // 0x50544752 ("PTGR")
+    uint32_t      version;     // 1
+    uint32_t      total_ranks; // Total worker processes expected
+    uint32_t      is_aborted;  // 1 if any process aborts/fails
+    uint64_t      job_id;      // Job / run identifier
+    uint64_t      reserved[2];
+    RankCoordSlot slots[MAX_RANKS];
+};
 #pragma pack(pop)
 
 static_assert(std::is_trivially_copyable<ShmZoneDescriptor>::value,
-              "ShmZoneDescriptor must be trivially copyable for MPI");
+              "ShmZoneDescriptor must be trivially copyable");
+static_assert(std::is_trivially_copyable<RankCoordSlot>::value,
+              "RankCoordSlot must be trivially copyable");
+static_assert(std::is_trivially_copyable<ShmCoordinator>::value,
+              "ShmCoordinator must be trivially copyable");
 
 struct alignas(8) ShmMasterHeader
 {

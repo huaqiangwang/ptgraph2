@@ -19,11 +19,6 @@ extern struct perf_dlfilter_fns perf_dlfilter_fns;
 #include <unordered_map>
 #include <vector>
 
-#if __has_include(<mpi.h>)
-#include <mpi.h>
-#define PTGRAPH_HAS_MPI 1
-#endif
-
 //
 // Structure tracking per-thread frame queue zones
 //
@@ -71,11 +66,17 @@ public:
     void  SetContext(void *ctx) { ctx_ = ctx; }
     void *GetContext() const { return ctx_; }
 
-    void     SetMpiRank(uint32_t rank) { mpi_rank_ = rank; }
-    uint32_t GetMpiRank() const { return mpi_rank_; }
+    void SetProcRank(int rank) { proc_rank_ = rank; }
+    int  GetProcRank() const { return proc_rank_; }
 
-    void     SetMpiSize(uint32_t size) { mpi_size_ = size; }
-    uint32_t GetMpiSize() const { return mpi_size_; }
+    void SetProcSize(int size) { proc_size_ = size; }
+    int  GetProcSize() const { return proc_size_; }
+
+    bool IsCoordinated() const { return proc_size_ > 1; }
+    bool IsMainProc() const { return proc_rank_ == 0; }
+
+    void               SetCoordId(const std::string &id) { coord_id_ = id; }
+    const std::string &GetCoordId() const { return coord_id_; }
 
     void SetUnlinkOnDestroy(bool enable) { unlink_on_destroy_ = enable; }
     bool GetUnlinkOnDestroy() const { return unlink_on_destroy_; }
@@ -127,10 +128,12 @@ public:
     // Collect local zone descriptors representing all SHM zones managed by this instance
     std::vector<ShmZoneDescriptor> GetLocalZoneDescriptors() const;
 
-#if defined(PTGRAPH_HAS_MPI)
-    // Use MPI_Allgather / MPI_Allgatherv to collect SHM zone descriptors from all ranks.
-    std::vector<ShmZoneDescriptor> GatherShmZonesMpi(MPI_Comm comm = MPI_COMM_WORLD);
-#endif
+    // Coordination via shared memory (replaces MPI)
+    bool                           PublishLocalZonesToCoordinator();
+    std::vector<ShmZoneDescriptor> CollectAllZonesFromCoordinator(int timeout_ms = 60000);
+
+    // Generate call graph from current SHM zones (or gathered zones)
+    void GenerateGraph(const std::string &outfile = "", const std::vector<ShmZoneDescriptor> &gathered_zones = {});
 
     // Resolve string from zone and offset
     static const char *ResolveString(const ShmZone &zone, uint64_t offset);
@@ -152,8 +155,9 @@ private:
     size_t      string_capacity_;
     size_t      max_threads_;
     uint32_t    current_string_zone_id_{0};
-    int         mpi_rank_{0};
-    int         mpi_size_{1};
+    int         proc_rank_{0};
+    int         proc_size_{1};
+    std::string coord_id_{"default"};
     bool        unlink_on_destroy_{false};
     bool        is_finished_{false};
     std::string outfilename_;

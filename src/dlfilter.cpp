@@ -7,34 +7,14 @@ extern "C" {
 // Table of callback functions provided by perf
 struct perf_dlfilter_fns perf_dlfilter_fns;
 
-#if defined(PTGRAPH_HAS_MPI)
-static bool g_mpi_initialized_by_filter = false;
-#endif
-
 int start(void **data, void *ctx)
 {
     // Initialize GraphDrawer and manage ctx
     auto drawer = new GraphDrawer(ctx);
     *data       = static_cast<void *>(drawer);
 
-#if defined(PTGRAPH_HAS_MPI)
-    int mpi_inited = 0;
-    MPI_Initialized(&mpi_inited);
-    if (!mpi_inited) {
-        int    argc = 0;
-        char **argv = nullptr;
-        if (MPI_Init(&argc, &argv) == MPI_SUCCESS) {
-            g_mpi_initialized_by_filter = true;
-            int rank;
-            int size;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            MPI_Comm_size(MPI_COMM_WORLD, &size);
-            drawer->SetMpiRank(rank);
-            drawer->SetMpiSize(size);
-        }
-    }
-#endif
-    LOG_INFO << "[ptgraph " << getpid() << "] Starting filter" << std::endl;
+    LOG_INFO << "[ptgraph pid=" << getpid() << " rank=" << drawer->GetProcRank()
+             << "/" << drawer->GetProcSize() << "] Starting filter" << std::endl;
 
     return 0;
 }
@@ -44,53 +24,45 @@ int stop(void *raw_state, [[maybe_unused]] void *ctx)
     auto drawer = static_cast<GraphDrawer *>(raw_state);
 
     if (drawer) {
-        LOG_INFO << "[ptgraph rank " << drawer->GetMpiRank() << "] Stats: "
+        LOG_INFO << "[ptgraph rank " << drawer->GetProcRank() << "] Stats: "
                  << "early_samples=" << drawer->GetEarlySamples()
                  << ", filtered_samples=" << drawer->GetFilteredSamples()
                  << ", inserted_frames=" << drawer->GetInsertedFrames()
                  << std::endl;
 
-#if defined(PTGRAPH_HAS_MPI)
-        int mpi_inited = 0;
-        MPI_Initialized(&mpi_inited);
-        if (mpi_inited) {
-            // Gather all SHM zone descriptors (Frames and symbols zones) from all MPI processes
-            auto gathered_zones = drawer->GatherShmZonesMpi();
+        drawer->Finish();
 
-            // Calculate total frames across all gathered zones
-            uint64_t total_gathered_frames = 0;
-            for (const auto &desc : gathered_zones) {
-                if (desc.type == ShmZoneType::THREAD) {
-                    total_gathered_frames += desc.element_count;
+        if (drawer->IsCoordinated()) {
+            if (drawer->IsMainProc()) {
+                // Rank 0 (Main process): Wait for all workers to finish and collect all zones
+                auto all_zones = drawer->CollectAllZonesFromCoordinator(60000);
+
+                uint64_t total_gathered_frames = 0;
+                for (const auto &desc : all_zones) {
+                    if (desc.type == ShmZoneType::THREAD) {
+                        total_gathered_frames += desc.element_count;
+                    }
                 }
-            }
 
-            // At rank 0 or for diagnostic output / downstream handoff:
-            if (drawer->GetMpiRank() == 0) {
-                std::fprintf(stderr,
-                             "[ptgraph dlfilter] MPI gathered %zu SHM zones across %u ranks, total frames inserted: %lu\n",
-                             gathered_zones.size(),
-                             drawer->GetMpiSize(),
-                             (unsigned long)total_gathered_frames);
-                LOG_INFO << "[ptgraph dlfilter] MPI total frames inserted across all ranks: "
-                         << total_gathered_frames << std::endl;
-            }
+                LOG_INFO << "[ptgraph main] Gathered " << all_zones.size()
+                         << " SHM zones across " << drawer->GetProcSize()
+                         << " processes, total frames: " << total_gathered_frames << std::endl;
 
-            MPI_Barrier(MPI_COMM_WORLD);
+                // Let Main process generate the final graph
+                drawer->GenerateGraph("", all_zones);
 
-            if (g_mpi_initialized_by_filter) {
-                int finalized = 0;
-                MPI_Finalized(&finalized);
-                if (!finalized) {
-                    MPI_Finalize();
-                }
-                g_mpi_initialized_by_filter = false;
+                // Record Rank 0 completion in coordinator
+                drawer->PublishLocalZonesToCoordinator();
+            } else {
+                // Worker process (Rank > 0): Publish local zones to coordinator and exit
+                drawer->PublishLocalZonesToCoordinator();
             }
+        } else {
+            // Standalone mode: Directly generate the graph locally
+            drawer->GenerateGraph();
         }
-#endif
     }
 
-    drawer->Finish();
     delete drawer;
     return 0;
 }

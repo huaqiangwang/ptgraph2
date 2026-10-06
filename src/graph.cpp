@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -25,24 +27,6 @@ GraphDrawer::GraphDrawer(void       *dlfilter_ctx,
       string_capacity_(string_capacity),
       max_threads_(max_threads)
 {
-#if defined(PTGRAPH_HAS_MPI)
-    int initialized = 0;
-    MPI_Initialized(&initialized);
-    if (initialized) {
-        int rank = 0;
-        int size = 1;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &size);
-        mpi_rank_ = static_cast<uint32_t>(rank);
-        mpi_size_ = static_cast<uint32_t>(size);
-        if (mpi_size_ > 1) {
-            shm_prefix_ += "_rank_" + std::to_string(mpi_rank_);
-        }
-    }
-#endif
-    CreateMasterZone();
-    CreateNewStringZone();
-
     int    argc = 0;
     char **argv = nullptr;
     if (ctx_ && perf_dlfilter_fns.args) {
@@ -50,35 +34,73 @@ GraphDrawer::GraphDrawer(void       *dlfilter_ctx,
     }
 
     //--------------------------
-    // Get parameter from '--dlarg'
-    // parameter usage:
-    // -f <filename> : specify output filename
-    // -j <json>    : specify JSON configuration file
-    std::regex re_remove_space(R"(^\s+|\s+$)");
-    std::regex re_split_cmdfiled(R"(\s*(-[fj]+)\s+([^\s]+)\s*)");
+    // Get parameters from '--dlarg'
+    // Support formats:
+    //   --dlarg "-r 0 -n 4 -c id -b 100 -e 200 -j conf.json -f out.dot"
+    //   --dlarg -r --dlarg 0 --dlarg -n --dlarg 4
+    //   --dlarg -r0 --dlarg -n4
+    std::vector<std::string> tokens;
+    for (int i = 0; i < argc; ++i) {
+        if (!argv[i])
+            continue;
+        std::istringstream iss(argv[i]);
+        std::string        tok;
+        while (iss >> tok) {
+            tokens.push_back(tok);
+        }
+    }
 
-    std::cmatch matches;
-    auto        argList = std::vector<std::pair<std::string, std::string>>{};
-    for (int i = 0; i < argc; i++) {
-        // remove any tailing and leading empty space
-        auto str = std::string(argv[i]);
-        str      = std::regex_replace(str, re_remove_space, "");
-        auto m   = std::regex_match(argv[i], matches, re_split_cmdfiled);
-        if (m) {
-            argList.push_back({matches[1], matches[2]});
+    std::string conf_path;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const std::string &tok = tokens[i];
+        if (tok == "-f") {
+            if (i + 1 < tokens.size())
+                outfilename_ = tokens[++i];
+        } else if (tok.rfind("-f", 0) == 0 && tok.size() > 2) {
+            outfilename_ = (tok[2] == '=') ? tok.substr(3) : tok.substr(2);
+        } else if (tok == "-j") {
+            if (i + 1 < tokens.size())
+                conf_path = tokens[++i];
+        } else if (tok.rfind("-j", 0) == 0 && tok.size() > 2) {
+            conf_path = (tok[2] == '=') ? tok.substr(3) : tok.substr(2);
+        } else if (tok == "-r") {
+            if (i + 1 < tokens.size())
+                proc_rank_ = std::stoi(tokens[++i]);
+        } else if (tok.rfind("-r", 0) == 0 && tok.size() > 2) {
+            proc_rank_ = std::stoi((tok[2] == '=') ? tok.substr(3) : tok.substr(2));
+        } else if (tok == "-n") {
+            if (i + 1 < tokens.size())
+                proc_size_ = std::stoi(tokens[++i]);
+        } else if (tok.rfind("-n", 0) == 0 && tok.size() > 2) {
+            proc_size_ = std::stoi((tok[2] == '=') ? tok.substr(3) : tok.substr(2));
+        } else if (tok == "-c") {
+            if (i + 1 < tokens.size())
+                coord_id_ = tokens[++i];
+        } else if (tok.rfind("-c", 0) == 0 && tok.size() > 2) {
+            coord_id_ = (tok[2] == '=') ? tok.substr(3) : tok.substr(2);
+        } else if (tok == "-b") {
+            if (i + 1 < tokens.size())
+                ts_rank_begin_ns_ = std::stoull(tokens[++i]);
+        } else if (tok.rfind("-b", 0) == 0 && tok.size() > 2) {
+            ts_rank_begin_ns_ = std::stoull((tok[2] == '=') ? tok.substr(3) : tok.substr(2));
+        } else if (tok == "-e") {
+            if (i + 1 < tokens.size())
+                ts_rank_end_ns_ = std::stoull(tokens[++i]);
+        } else if (tok.rfind("-e", 0) == 0 && tok.size() > 2) {
+            ts_rank_end_ns_ = std::stoull((tok[2] == '=') ? tok.substr(3) : tok.substr(2));
         }
     }
-    for (auto it = argList.cbegin(); it != argList.cend(); ++it) {
-        const std::string &argf   = it->first;
-        auto               argstr = it->second;
-        if (argf == "-f") {
-            outfilename_ = argstr;
-        } else if (argf == "-j") {
-            auto conf = argstr;
-            LoadConfig(conf);
-        }
+
+    if (!conf_path.empty()) {
+        LoadConfig(conf_path);
     }
-    //--------------------------
+
+    if (proc_size_ > 1) {
+        shm_prefix_ += "_rank_" + std::to_string(proc_rank_);
+    }
+
+    CreateMasterZone();
+    CreateNewStringZone();
 }
 
 GraphDrawer::~GraphDrawer()
@@ -92,20 +114,23 @@ GraphDrawer::~GraphDrawer()
 void GraphDrawer::LoadConfig(const std::string &conf_file)
 {
     json_para_.Parse(conf_file.c_str());
-    ts_global_begin_ns_ = json_para_.timeZone->begin;
-    ts_global_end_ns_   = json_para_.timeZone->end;
 
-    if (ts_global_begin_ns_ >= ts_global_end_ns_) {
-        LOG_WARNING << "Invalid time zone, TimeZone failed: ts_global_begin_ns_"
-                    << ts_global_begin_ns_ << " >= ts_global_end_ns_" << ts_global_end_ns_ << std::endl;
-        ts_global_begin_ns_ = 0;
-        ts_global_end_ns_   = 0;
+    // Only compute from json_para_.timeZone if ts_rank_begin_ns_/ts_rank_end_ns_ were not explicitly set via -b/-e
+    if (ts_rank_begin_ns_ == 0 && ts_rank_end_ns_ == 0 && json_para_.timeZone) {
+        ts_global_begin_ns_ = json_para_.timeZone->begin;
+        ts_global_end_ns_   = json_para_.timeZone->end;
+
+        if (ts_global_begin_ns_ >= ts_global_end_ns_) {
+            LOG_WARNING << "Invalid time zone, TimeZone failed: ts_global_begin_ns_"
+                        << ts_global_begin_ns_ << " >= ts_global_end_ns_" << ts_global_end_ns_ << std::endl;
+            ts_global_begin_ns_ = 0;
+            ts_global_end_ns_   = 0;
+        } else {
+            auto ts_span_ns   = ts_global_end_ns_ - ts_global_begin_ns_;
+            ts_rank_begin_ns_ = ts_global_begin_ns_ + ts_span_ns * proc_rank_ / proc_size_;
+            ts_rank_end_ns_   = ts_global_begin_ns_ + ts_span_ns * (proc_rank_ + 1) / proc_size_;
+        }
     }
-
-    auto ts_span_ns = ts_global_end_ns_ - ts_global_begin_ns_;
-
-    ts_rank_begin_ns_ = ts_global_begin_ns_ + ts_span_ns * mpi_rank_ / mpi_size_;
-    ts_rank_end_ns_   = ts_global_begin_ns_ + ts_span_ns * (mpi_rank_ + 1) / mpi_size_;
 }
 
 // Return 0: sample will be passed to `filter_event`
@@ -239,7 +264,7 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     ele.caller_ip = sample->addr;
     ele.pid       = sample->pid >= 0 ? static_cast<uint32_t>(sample->pid) : 0;
     ele.tid       = sample->tid >= 0 ? static_cast<uint32_t>(sample->tid) : 0;
-    ele.rank      = mpi_rank_;
+    ele.rank      = static_cast<uint32_t>(proc_rank_);
     ele.cpu       = sample->cpu >= 0 ? static_cast<uint16_t>(sample->cpu) : 0;
     ele.flags     = sample->flags;
 
@@ -412,7 +437,7 @@ std::vector<ShmZoneDescriptor> GraphDrawer::GetLocalZoneDescriptors() const
     // Master zone
     if (master_zone_.addr != MAP_FAILED && master_zone_.addr != nullptr) {
         ShmZoneDescriptor desc{};
-        desc.rank = mpi_rank_;
+        desc.rank = static_cast<uint32_t>(proc_rank_);
         desc.pid  = static_cast<uint32_t>(getpid());
         desc.type = ShmZoneType::MASTER;
         std::strncpy(desc.shm_name, master_zone_.shm_name.c_str(), sizeof(desc.shm_name) - 1);
@@ -428,7 +453,7 @@ std::vector<ShmZoneDescriptor> GraphDrawer::GetLocalZoneDescriptors() const
     for (const auto &sz : string_zones_) {
         if (sz.addr != MAP_FAILED && sz.addr != nullptr) {
             ShmZoneDescriptor desc{};
-            desc.rank    = mpi_rank_;
+            desc.rank    = static_cast<uint32_t>(proc_rank_);
             desc.pid     = static_cast<uint32_t>(getpid());
             desc.zone_id = sz.zone_id;
             desc.type    = ShmZoneType::STRING;
@@ -449,7 +474,7 @@ std::vector<ShmZoneDescriptor> GraphDrawer::GetLocalZoneDescriptors() const
         for (const auto &tz : stream.zones) {
             if (tz.addr != MAP_FAILED && tz.addr != nullptr) {
                 ShmZoneDescriptor desc{};
-                desc.rank    = mpi_rank_;
+                desc.rank    = static_cast<uint32_t>(proc_rank_);
                 desc.pid     = stream.pid;
                 desc.tid     = stream.tid;
                 desc.zone_id = tz.zone_id;
@@ -469,55 +494,148 @@ std::vector<ShmZoneDescriptor> GraphDrawer::GetLocalZoneDescriptors() const
     return descs;
 }
 
-#if defined(PTGRAPH_HAS_MPI)
-std::vector<ShmZoneDescriptor> GraphDrawer::GatherShmZonesMpi(MPI_Comm comm)
+bool GraphDrawer::PublishLocalZonesToCoordinator()
 {
-    int initialized = 0;
-    MPI_Initialized(&initialized);
-    if (!initialized) {
-        return GetLocalZoneDescriptors();
+    if (proc_size_ <= 1) {
+        return true;
     }
 
-    int comm_size = 1;
-    int rank      = 0;
-    MPI_Comm_size(comm, &comm_size);
-    MPI_Comm_rank(comm, &rank);
-    mpi_rank_ = static_cast<uint32_t>(rank);
-    mpi_size_ = static_cast<uint32_t>(comm_size);
-
-    std::vector<ShmZoneDescriptor> local_descs = GetLocalZoneDescriptors();
-    int                            local_count = static_cast<int>(local_descs.size());
-
-    std::vector<int> recv_counts(comm_size, 0);
-    MPI_Allgather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
-
-    std::vector<int> displs(comm_size, 0);
-    int              total_count = 0;
-    for (int i = 0; i < comm_size; ++i) {
-        displs[i] = total_count * static_cast<int>(sizeof(ShmZoneDescriptor));
-        total_count += recv_counts[i];
+    std::string coord_name = "/ptgraph_coord_" + coord_id_;
+    int         fd         = shm_open(coord_name.c_str(), O_RDWR, 0666);
+    if (fd < 0) {
+        LOG_ERROR << "[Rank " << proc_rank_ << "] Failed to open coordinator SHM " << coord_name << ": " << strerror(errno) << std::endl;
+        return false;
     }
 
-    std::vector<int> recv_byte_counts(comm_size, 0);
-    for (int i = 0; i < comm_size; ++i) {
-        recv_byte_counts[i] = recv_counts[i] * static_cast<int>(sizeof(ShmZoneDescriptor));
+    void *addr = mmap(nullptr, sizeof(ShmCoordinator), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (addr == MAP_FAILED) {
+        LOG_ERROR << "[Rank " << proc_rank_ << "] Failed to mmap coordinator SHM" << std::endl;
+        return false;
     }
 
-    std::vector<ShmZoneDescriptor> all_descs(total_count);
-    int                            send_bytes = local_count * static_cast<int>(sizeof(ShmZoneDescriptor));
+    auto *coord = reinterpret_cast<ShmCoordinator *>(addr);
+    if (proc_rank_ >= static_cast<int>(MAX_RANKS)) {
+        munmap(addr, sizeof(ShmCoordinator));
+        return false;
+    }
 
-    MPI_Allgatherv(local_descs.data(),
-                   send_bytes,
-                   MPI_BYTE,
-                   all_descs.data(),
-                   recv_byte_counts.data(),
-                   displs.data(),
-                   MPI_BYTE,
-                   comm);
+    auto &slot            = coord->slots[proc_rank_];
+    slot.rank             = static_cast<uint32_t>(proc_rank_);
+    slot.pid              = static_cast<uint32_t>(getpid());
+    slot.total_frames     = inserted_frames_count_;
+    slot.early_samples    = early_samples_count_;
+    slot.filtered_samples = filtered_samples_count_;
 
+    auto   local_descs = GetLocalZoneDescriptors();
+    size_t copy_count  = std::min(local_descs.size(), MAX_ZONES_PER_RANK);
+    slot.zone_count    = static_cast<uint32_t>(copy_count);
+    for (size_t i = 0; i < copy_count; ++i) {
+        slot.zones[i] = local_descs[i];
+    }
+
+    // Atomically signal completion
+    __atomic_store_n(&slot.status, static_cast<uint32_t>(WorkerState::COMPLETED), __ATOMIC_RELEASE);
+    munmap(addr, sizeof(ShmCoordinator));
+    return true;
+}
+
+std::vector<ShmZoneDescriptor> GraphDrawer::CollectAllZonesFromCoordinator(int timeout_ms)
+{
+    std::vector<ShmZoneDescriptor> all_descs;
+    auto                           local_descs = GetLocalZoneDescriptors();
+    all_descs.insert(all_descs.end(), local_descs.begin(), local_descs.end());
+
+    if (proc_size_ <= 1) {
+        return all_descs;
+    }
+
+    std::string coord_name = "/ptgraph_coord_" + coord_id_;
+    int         fd         = shm_open(coord_name.c_str(), O_RDWR, 0666);
+    if (fd < 0) {
+        LOG_ERROR << "[Rank 0] Cannot open coordinator SHM " << coord_name << ": " << strerror(errno) << std::endl;
+        return all_descs;
+    }
+
+    void *addr = mmap(nullptr, sizeof(ShmCoordinator), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (addr == MAP_FAILED) {
+        LOG_ERROR << "[Rank 0] Cannot mmap coordinator SHM" << std::endl;
+        return all_descs;
+    }
+
+    auto *coord = reinterpret_cast<ShmCoordinator *>(addr);
+
+    // Wait for ranks 1 .. proc_size_-1
+    int elapsed_ms = 0;
+    for (int r = 1; r < proc_size_; ++r) {
+        while (true) {
+            uint32_t status = __atomic_load_n(&coord->slots[r].status, __ATOMIC_ACQUIRE);
+            if (status == static_cast<uint32_t>(WorkerState::COMPLETED) ||
+                status == static_cast<uint32_t>(WorkerState::FAILED)) {
+                break;
+            }
+            if (coord->is_aborted) {
+                LOG_ERROR << "[Rank 0] Coordinator marked abort." << std::endl;
+                break;
+            }
+            usleep(10000); // 10ms
+            elapsed_ms += 10;
+            if (timeout_ms > 0 && elapsed_ms >= timeout_ms) {
+                LOG_WARNING << "[Rank 0] Timeout waiting for worker rank " << r << std::endl;
+                break;
+            }
+        }
+
+        const auto &slot = coord->slots[r];
+        if (slot.status == static_cast<uint32_t>(WorkerState::COMPLETED)) {
+            for (uint32_t z = 0; z < slot.zone_count; ++z) {
+                all_descs.push_back(slot.zones[z]);
+            }
+        }
+    }
+
+    munmap(addr, sizeof(ShmCoordinator));
     return all_descs;
 }
-#endif
+
+void GraphDrawer::GenerateGraph(const std::string &outfile, const std::vector<ShmZoneDescriptor> &gathered_zones)
+{
+    std::string target_file = outfile.empty() ? outfilename_ : outfile;
+    if (target_file.empty()) {
+        target_file = "callgraph.dot";
+    }
+
+    LOG_INFO << "[ptgraph] Generating call graph into " << target_file << "..." << std::endl;
+
+    std::vector<ShmZoneDescriptor> all_zones = gathered_zones;
+    if (all_zones.empty()) {
+        if (proc_size_ > 1 && proc_rank_ == 0) {
+            all_zones = CollectAllZonesFromCoordinator();
+        } else {
+            all_zones = GetLocalZoneDescriptors();
+        }
+    }
+
+    uint64_t total_frames = 0;
+    for (const auto &desc : all_zones) {
+        if (desc.type == ShmZoneType::THREAD) {
+            total_frames += desc.element_count;
+        }
+    }
+
+    std::ofstream out(target_file);
+    if (out.is_open()) {
+        out << "digraph CallGraph {\n";
+        out << "  node [shape=box];\n";
+        out << "  // Total frames: " << total_frames << "\n";
+        out << "}\n";
+        out.close();
+    }
+
+    LOG_INFO << "[ptgraph] Call graph generation complete into " << target_file
+             << ". Total frames processed: " << total_frames << std::endl;
+}
 
 const char *GraphDrawer::ResolveString(const ShmZone &zone, uint64_t offset)
 {

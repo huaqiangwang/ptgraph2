@@ -134,54 +134,92 @@ int main()
     PtGraphReader::UnlinkAll(prefix);
     std::cout << "[TEST] All assertions passed successfully!" << std::endl;
 
-#if defined(PTGRAPH_HAS_MPI)
-    // Test MPI gathering if MPI was initialized
-    int mpi_inited = 0;
-    MPI_Initialized(&mpi_inited);
-    if (!mpi_inited) {
-        MPI_Init(nullptr, nullptr);
-    }
+    // Test Coordinator Shared Memory multi-process simulation
+    std::cout << "[TEST] Testing Coordinator SHM multi-process aggregation..." << std::endl;
+    std::string test_coord_id  = "test_coord_" + std::to_string(getpid());
+    std::string coord_shm_name = "/ptgraph_coord_" + test_coord_id;
 
-    int rank = 0;
-    int size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    int c_fd = shm_open(coord_shm_name.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
+    assert(c_fd >= 0);
+    assert(ftruncate(c_fd, sizeof(ShmCoordinator)) == 0);
+    void *c_addr = mmap(nullptr, sizeof(ShmCoordinator), PROT_READ | PROT_WRITE, MAP_SHARED, c_fd, 0);
+    assert(c_addr != MAP_FAILED);
+    close(c_fd);
 
-    std::string mpi_prefix = "ptgraph_mpi_test";
-    PtGraphReader::UnlinkAll(mpi_prefix + (size > 1 ? ("_rank_" + std::to_string(rank)) : ""));
+    std::memset(c_addr, 0, sizeof(ShmCoordinator));
+    auto *coord        = reinterpret_cast<ShmCoordinator *>(c_addr);
+    coord->magic       = 0x50544752;
+    coord->version     = 1;
+    coord->total_ranks = 3;
 
-    {
-        GraphDrawer mpi_drawer(nullptr, mpi_prefix, TEST_FRAME_CAP, TEST_STR_CAP, TEST_MAX_TH);
-        // Each rank creates unique frames for its own TID
-        uint32_t my_tid = 10000 + rank;
-        for (int i = 0; i < 3; ++i) {
+    constexpr int NUM_TEST_PROCS = 3;
+    std::string   multi_prefix   = "ptgraph_multi_test";
+
+    // Simulate Worker 1 and Worker 2 publishing zones
+    for (int r = 1; r < NUM_TEST_PROCS; ++r) {
+        std::string worker_prefix = multi_prefix;
+        GraphDrawer worker_drawer(nullptr, worker_prefix, TEST_FRAME_CAP, TEST_STR_CAP, TEST_MAX_TH);
+        worker_drawer.SetProcRank(r);
+        worker_drawer.SetProcSize(NUM_TEST_PROCS);
+        worker_drawer.SetCoordId(test_coord_id);
+
+        for (int i = 0; i < 4; ++i) {
             FrameEle fe{};
-            fe.timestamp = 5000 + i;
-            fe.pid       = 500 + rank;
-            fe.tid       = my_tid;
+            fe.timestamp = 4000 + i;
+            fe.pid       = 400 + r;
+            fe.tid       = 4000 + r;
             fe.type      = FrameType::CALL;
-            mpi_drawer.AppendFrameWithSymbols(fe, "mpi_func_" + std::to_string(rank), "caller", "lib.so");
+            worker_drawer.AppendFrameWithSymbols(fe, "worker_sym_" + std::to_string(r), "caller", "lib.so");
         }
-        mpi_drawer.Finish();
+        worker_drawer.Finish();
+        bool pub_ok = worker_drawer.PublishLocalZonesToCoordinator();
+        assert(pub_ok && "Worker publish failed");
+    }
 
-        auto all_gathered = mpi_drawer.GatherShmZonesMpi(MPI_COMM_WORLD);
-        if (rank == 0) {
-            std::cout << "[TEST MPI] Gathered " << all_gathered.size() << " zones across " << size << " ranks." << std::endl;
+    // Now simulate Main (Rank 0) collecting all zones
+    {
+        std::string main_prefix = multi_prefix;
+        GraphDrawer main_drawer(nullptr, main_prefix, TEST_FRAME_CAP, TEST_STR_CAP, TEST_MAX_TH);
+        main_drawer.SetProcRank(0);
+        main_drawer.SetProcSize(NUM_TEST_PROCS);
+        main_drawer.SetCoordId(test_coord_id);
+
+        for (int i = 0; i < 2; ++i) {
+            FrameEle fe{};
+            fe.timestamp = 4000 + i;
+            fe.pid       = 400;
+            fe.tid       = 4000;
+            fe.type      = FrameType::CALL;
+            main_drawer.AppendFrameWithSymbols(fe, "main_sym", "caller", "lib.so");
         }
-        assert(all_gathered.size() >= static_cast<size_t>(size * 2) && "Expected master + string + thread zones from each rank");
+        main_drawer.Finish();
+
+        auto all_collected = main_drawer.CollectAllZonesFromCoordinator(1000);
+        std::cout << "[TEST] Main collected " << all_collected.size() << " SHM zones from coordinator." << std::endl;
+        assert(all_collected.size() >= static_cast<size_t>(NUM_TEST_PROCS * 2) && "Expected master + string + thread zones from all processes");
+
+        // Verify total frames
+        uint64_t total_frames = 0;
+        for (const auto &z : all_collected) {
+            if (z.type == ShmZoneType::THREAD) {
+                total_frames += z.element_count;
+            }
+        }
+        std::cout << "[TEST] Total frames aggregated: " << total_frames << " (expected 10)" << std::endl;
+        assert(total_frames == 10 && "Expected 2 + 4 + 4 = 10 frames");
+
+        main_drawer.GenerateGraph("test_callgraph.dot");
     }
 
-    PtGraphReader::UnlinkAll(mpi_prefix + (size > 1 ? ("_rank_" + std::to_string(rank)) : ""));
-
-    int finalized = 0;
-    MPI_Finalized(&finalized);
-    if (!finalized) {
-        MPI_Finalize();
+    // Clean up
+    munmap(c_addr, sizeof(ShmCoordinator));
+    shm_unlink(coord_shm_name.c_str());
+    for (int r = 0; r < NUM_TEST_PROCS; ++r) {
+        PtGraphReader::UnlinkAll(multi_prefix + "_rank_" + std::to_string(r));
     }
-    if (rank == 0) {
-        std::cout << "[TEST MPI] MPI test completed successfully!" << std::endl;
-    }
-#endif
+    PtGraphReader::UnlinkAll(multi_prefix);
+    std::remove("test_callgraph.dot");
 
+    std::cout << "[TEST] Multi-process Coordinator test passed successfully!" << std::endl;
     return 0;
 }
