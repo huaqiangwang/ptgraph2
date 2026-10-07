@@ -35,7 +35,7 @@ int stop(void *raw_state, [[maybe_unused]] void *ctx)
         if (drawer->IsCoordinated()) {
             if (drawer->IsMainProc()) {
                 // Rank 0 (Main process): Wait for all workers to finish and collect all zones
-                auto all_zones = drawer->CollectAllZonesFromCoordinator(60000);
+                auto all_zones = drawer->CollectAllZonesFromCoordinator(300000);
 
                 uint64_t total_gathered_frames = 0;
                 for (const auto &desc : all_zones) {
@@ -79,6 +79,12 @@ int filter_event_early(void *raw_state, const struct perf_dlfilter_sample *sampl
     auto ret = drawer->FilterByTimestamp(sample->time);
     if (ret != 0) {
         return ret;
+    }
+
+    static uint64_t next_process_hint_time = 0;
+    if (sample->time > next_process_hint_time) {
+        std::cout << "[PID " << getpid() << "] Processing ts: " << sample->time << std::endl;
+        next_process_hint_time = sample->time + 10000000;
     }
 
     const auto &para = drawer->GetJsonPara();

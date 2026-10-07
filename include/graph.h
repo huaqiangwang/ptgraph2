@@ -201,6 +201,9 @@ public:
     // Multi-threaded generation of Perfetto timeline traces by TID
     void GeneratePerfettoTrace(const std::string &outfile, const std::vector<ShmZoneDescriptor> &all_zones);
 
+    // Gzip compress a file
+    static bool CompressFileGzip(const std::string &src_path, const std::string &dst_path);
+
     // Resolve string from zone and offset
     static const char *ResolveString(const ShmZone &zone, uint64_t offset);
 

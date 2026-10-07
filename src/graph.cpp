@@ -8,7 +8,10 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <regex>
 #include <sstream>
@@ -18,6 +21,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <zlib.h>
 
 // ============================================================================
 // GraphDrawer Implementation
@@ -262,6 +266,8 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         return;
     }
     total_samples_++;
+    LOG_TRACE << "[TID" << sample->tid << "] DlFilter: TS" << sample->time << std::hex
+              << sample->flags << std::dec;
 
     void *active_ctx = ctx ? ctx : ctx_;
 
@@ -360,6 +366,7 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         caller_sym_str = addr_sym;
         dso_str        = ip_dso;
     }
+    LOG_TRACE << ", IP " << ip_sym << ", Addr " << addr_sym << ", DSO " << dso_str << std::endl;
 
     // Check funcZone filtering
     if (json_para_.funcZone) {
@@ -767,6 +774,83 @@ const char *ShmStringResolver::Resolve(uint32_t rank, const StringRef &ref) cons
 
 namespace {
 
+    class ProgressReporter
+    {
+    public:
+        ProgressReporter(const std::string &task_name, uint64_t total_items, bool is_bytes = false)
+            : task_name_(task_name),
+              total_items_(total_items),
+              is_bytes_(is_bytes),
+              is_tty_(isatty(fileno(stdout)) != 0),
+              last_reported_pct_(-1),
+              current_items_(0)
+        {
+            step_ = std::max<uint64_t>(1, total_items_ / (is_tty_ ? 200 : 10));
+        }
+
+        void Update(uint64_t current)
+        {
+            current_items_ = current;
+            if (total_items_ == 0)
+                return;
+
+            if (current >= total_items_ || current % step_ == 0) {
+                Report(current);
+            }
+        }
+
+        void Finish()
+        {
+            if (total_items_ > 0 && current_items_ < total_items_) {
+                Report(total_items_);
+            }
+            if (is_tty_ && total_items_ > 0) {
+                std::cout << std::endl;
+            }
+        }
+
+    private:
+        void Report(uint64_t current)
+        {
+            int pct = static_cast<int>((current * 100) / total_items_);
+            if (pct > 100)
+                pct = 100;
+
+            if (is_tty_) {
+                std::cout << "\33[2K\r[INFO] [ptgraph] " << task_name_ << ": " << pct << "% ("
+                          << FormatCount(current) << "/" << FormatCount(total_items_) << ")"
+                          << std::flush;
+                last_reported_pct_ = pct;
+            } else {
+                if (last_reported_pct_ == -1 || pct / 10 != last_reported_pct_ / 10 || current >= total_items_) {
+                    LOG_INFO << "[ptgraph] " << task_name_ << ": " << pct << "% ("
+                             << FormatCount(current) << "/" << FormatCount(total_items_) << ")"
+                             << std::endl;
+                    last_reported_pct_ = pct;
+                }
+            }
+        }
+
+        std::string FormatCount(uint64_t count) const
+        {
+            if (is_bytes_) {
+                double             mb = static_cast<double>(count) / (1024.0 * 1024.0);
+                std::ostringstream oss;
+                oss << std::fixed << std::setprecision(1) << mb << " MB";
+                return oss.str();
+            }
+            return std::to_string(count);
+        }
+
+        std::string task_name_;
+        uint64_t    total_items_;
+        bool        is_bytes_;
+        bool        is_tty_;
+        int         last_reported_pct_;
+        uint64_t    current_items_;
+        uint64_t    step_;
+    };
+
     struct StackFrame
     {
         uint64_t    timestamp{0};
@@ -792,7 +876,9 @@ namespace {
                          const JsonPara                       &json_para,
                          bool                                  per_tid_mode,
                          Perfetto                             *per_tid_writer,
-                         std::vector<TimelineEvent>           &out_events)
+                         std::vector<TimelineEvent>           &out_events,
+                         const std::function<void(uint64_t)>  &on_progress = nullptr,
+                         std::mutex                           *log_mutex   = nullptr)
     {
         std::vector<FrameEle> frames;
 
@@ -852,15 +938,25 @@ namespace {
         uint64_t syscalls_count       = 0;
         uint64_t tail_pops_count      = 0;
         size_t   max_depth            = 0;
+        uint64_t local_count          = 0;
 
         for (const auto &ele : frames) {
             std::string sym_str        = resolver.Resolve(ele.rank, ele.sym);
             std::string caller_sym_str = resolver.Resolve(ele.rank, ele.caller_sym);
             std::string dso_str        = resolver.Resolve(ele.rank, ele.dso);
 
-            LOG_DEBUG << "FrameEle: TID " << ele.tid << ", PID " << ele.pid << ", Timestamp " << ele.timestamp
-                      << ", flags " << std::hex << ele.flags << std::dec << ", IP " << caller_sym_str
-                      << ", Addr " << sym_str << std::endl;
+            local_count++;
+            if (local_count >= 20000) {
+                if (on_progress) {
+                    on_progress(local_count);
+                }
+                local_count = 0;
+            }
+
+            LOG_DEBUG << std::endl
+                      << "-----------------------------------------------" << std::endl;
+            LOG_DEBUG << "[TID" << ele.tid << "] FrameEle: TS " << ele.timestamp << ", flags " << std::hex
+                      << ele.flags << std::dec << ", IP " << caller_sym_str << ", Addr " << sym_str << std::endl;
 
             if (sym_str.empty() && ele.ip) {
                 char buf[32];
@@ -1042,6 +1138,10 @@ namespace {
             }
         }
 
+        if (local_count > 0 && on_progress) {
+            on_progress(local_count);
+        }
+
         // Pop any remaining unreturned frames at stream end
         while (!stack.empty()) {
             tail_pops_count++;
@@ -1062,12 +1162,21 @@ namespace {
             }
         }
 
+        if (log_mutex) {
+            log_mutex->lock();
+        }
+        if (isatty(fileno(stdout))) {
+            std::cout << "\33[2K\r";
+        }
         LOG_INFO << "[ptgraph] Thread " << tid << " replay summary: " << frames.size() << " frames ("
                  << calls_count << " calls, " << rets_count << " rets ["
                  << exact_match_count << " exact, " << deep_match_count << " deep, "
                  << fallback_match_count << " fallback, " << empty_rets_count << " pre-trace empty], "
                  << syscalls_count << " syscalls, " << tail_pops_count << " tail pops, max stack depth: "
                  << max_depth << ")" << std::endl;
+        if (log_mutex) {
+            log_mutex->unlock();
+        }
     }
 
 } // namespace
@@ -1162,7 +1271,28 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
     bool   is_per_tid = GetPerTidOutput();
     size_t num_tids   = thread_keys.size();
 
-    LOG_INFO << "[ptgraph] Replaying timelines for " << num_tids << " threads concurrently..." << std::endl;
+    uint64_t total_replay_frames = 0;
+    for (const auto &pair : thread_zones_map) {
+        for (const auto &desc : pair.second) {
+            total_replay_frames += desc.element_count;
+        }
+    }
+
+    LOG_INFO << "[ptgraph] Replaying timelines for " << num_tids << " threads concurrently ("
+             << total_replay_frames << " frames)..." << std::endl;
+
+    ProgressReporter      replay_progress("Replaying timelines", total_replay_frames);
+    std::atomic<uint64_t> replayed_frames_total{0};
+    std::mutex            replay_progress_mutex;
+    if (total_replay_frames > 0) {
+        replay_progress.Update(0);
+    }
+
+    auto on_replay_progress = [&](uint64_t count) {
+        uint64_t                    current = replayed_frames_total.fetch_add(count, std::memory_order_relaxed) + count;
+        std::lock_guard<std::mutex> lock(replay_progress_mutex);
+        replay_progress.Update(current);
+    };
 
     unsigned int num_workers = std::thread::hardware_concurrency();
     if (num_workers == 0)
@@ -1197,7 +1327,8 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
                 }
 
                 ReplayOneThread(pidtid, thread_zones_map[pidtid], resolver, json_para_,
-                                is_per_tid, per_tid_writer.get(), per_thread_results[idx]);
+                                is_per_tid, per_tid_writer.get(), per_thread_results[idx],
+                                on_replay_progress, &replay_progress_mutex);
 
                 if (per_tid_writer) {
                     per_tid_writer->Flush();
@@ -1209,6 +1340,7 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
     for (auto &t : workers) {
         t.join();
     }
+    replay_progress.Finish();
 
     if (is_per_tid) {
         LOG_INFO << "[ptgraph] Per-TID Perfetto trace files generated successfully for "
@@ -1217,8 +1349,18 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
     }
 
     // 4. In unified mode: serialize all buffered events chronologically into outfile
-    LOG_INFO << "[ptgraph] Serializing unified trace into " << outfile << "..." << std::endl;
-    Perfetto unified(outfile);
+    bool        ends_with_gz      = (outfile.size() >= 3 && outfile.substr(outfile.size() - 3) == ".gz");
+    std::string uncompressed_file = ends_with_gz ? (outfile + ".tmp") : outfile;
+    std::string gz_file           = ends_with_gz ? outfile : (outfile + ".gz");
+
+    uint64_t total_events_to_write = 0;
+    for (size_t i = 0; i < num_tids; ++i) {
+        total_events_to_write += per_thread_results[i].size();
+    }
+
+    LOG_INFO << "[ptgraph] Serializing unified trace into " << uncompressed_file
+             << " (" << total_events_to_write << " events across " << num_tids << " threads)..." << std::endl;
+    Perfetto unified(uncompressed_file);
 
     for (const auto &pair : pid_to_comm) {
         unified.WriteProcessRecord(pair.first, std::make_shared<std::string>(pair.second));
@@ -1248,6 +1390,11 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
         }
     }
 
+    ProgressReporter ser_progress("Writing " + uncompressed_file, total_events_to_write);
+    if (total_events_to_write > 0) {
+        ser_progress.Update(0);
+    }
+
     uint64_t total_events_written = 0;
     while (!pq.empty()) {
         auto top = pq.top();
@@ -1266,6 +1413,7 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
                                    std::make_shared<std::string>(ev.sym), 0);
         }
         total_events_written++;
+        ser_progress.Update(total_events_written);
 
         if (top.event_idx + 1 < per_thread_results[top.tid_idx].size()) {
             pq.push({per_thread_results[top.tid_idx][top.event_idx + 1].timestamp,
@@ -1273,9 +1421,82 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
         }
     }
 
+    ser_progress.Finish();
     unified.Flush();
-    LOG_INFO << "[ptgraph] Unified Perfetto trace written to " << outfile
+    LOG_INFO << "[ptgraph] Unified Perfetto trace written to " << uncompressed_file
              << " (" << total_events_written << " events across " << num_tids << " threads)." << std::endl;
+
+    // 5. In unified mode: gzip compress the generated trace file
+    CompressFileGzip(uncompressed_file, gz_file);
+    if (ends_with_gz) {
+        std::remove(uncompressed_file.c_str());
+    }
+}
+
+bool GraphDrawer::CompressFileGzip(const std::string &src_path, const std::string &dst_path)
+{
+    FILE *in = fopen(src_path.c_str(), "rb");
+    if (!in) {
+        LOG_ERROR << "[ptgraph] Failed to open " << src_path << " for gzip compression: "
+                  << strerror(errno) << std::endl;
+        return false;
+    }
+
+    gzFile out = gzopen(dst_path.c_str(), "wb6");
+    if (!out) {
+        LOG_ERROR << "[ptgraph] Failed to create " << dst_path << " for gzip compression: "
+                  << strerror(errno) << std::endl;
+        fclose(in);
+        return false;
+    }
+
+    gzbuffer(out, 512 * 1024);
+
+    struct stat st{};
+    uint64_t    total_bytes = 0;
+    if (fstat(fileno(in), &st) == 0 && st.st_size > 0) {
+        total_bytes = static_cast<uint64_t>(st.st_size);
+    }
+
+    LOG_INFO << "[ptgraph] Compressing " << src_path << " to " << dst_path << "..." << std::endl;
+    ProgressReporter gz_progress("Compressing " + src_path, total_bytes, true);
+    if (total_bytes > 0) {
+        gz_progress.Update(0);
+    }
+
+    const size_t      buf_size = 512 * 1024;
+    std::vector<char> buffer(buf_size);
+    uint64_t          bytes_read_total = 0;
+
+    while (true) {
+        size_t n = fread(buffer.data(), 1, buf_size, in);
+        if (n == 0)
+            break;
+        int written = gzwrite(out, buffer.data(), static_cast<unsigned int>(n));
+        if (written <= 0) {
+            LOG_ERROR << "[ptgraph] Error writing to gzip file " << dst_path << std::endl;
+            gzclose(out);
+            fclose(in);
+            return false;
+        }
+        bytes_read_total += n;
+        gz_progress.Update(bytes_read_total);
+    }
+
+    gz_progress.Finish();
+    gzclose(out);
+    fclose(in);
+
+    struct stat dst_st{};
+    if (stat(dst_path.c_str(), &dst_st) == 0) {
+        double orig_mb = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
+        double comp_mb = static_cast<double>(dst_st.st_size) / (1024.0 * 1024.0);
+        double ratio   = total_bytes > 0 ? (static_cast<double>(dst_st.st_size) * 100.0 / total_bytes) : 0.0;
+        LOG_INFO << "[ptgraph] Gzip compression finished: " << dst_path
+                 << " (" << std::fixed << std::setprecision(1) << orig_mb << " MB -> "
+                 << comp_mb << " MB, " << ratio << "%)" << std::endl;
+    }
+    return true;
 }
 
 void GraphDrawer::GenerateGraph(const std::string &outfile, const std::vector<ShmZoneDescriptor> &gathered_zones)

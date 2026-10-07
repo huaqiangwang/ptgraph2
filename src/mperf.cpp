@@ -97,6 +97,16 @@ bool ParsePerfDataSampleTime(const std::string &path, uint64_t &out_begin_ns, ui
     return (out_begin_ns > 0 && out_end_ns > out_begin_ns);
 }
 
+[[maybe_unused]] static std::string FormatPerfTime(uint64_t ns)
+{
+    std::string s = std::to_string(ns);
+    if (s.length() <= 9) {
+        s.insert(0, 10 - s.length(), '0');
+    }
+    s.insert(s.length() - 9, ".");
+    return s;
+}
+
 void PrintUsage(const char *prog)
 {
     std::cout << "Usage: " << prog << " [options]\n"

@@ -2,6 +2,7 @@
 #include <cassert>
 #include <iostream>
 #include <vector>
+#include <zlib.h>
 
 struct perf_dlfilter_fns perf_dlfilter_fns{};
 
@@ -220,6 +221,17 @@ int main()
         ftf_file.close();
         std::remove(test_ftf.c_str());
         std::cout << "[TEST] Unified Perfetto trace test passed!" << std::endl;
+
+        // Verify gzip compressed unified trace
+        std::string test_ftf_gz = test_ftf + ".gz";
+        gzFile      gz_f        = gzopen(test_ftf_gz.c_str(), "rb");
+        assert(gz_f != nullptr && "Expected test_unified.ftf.gz to exist");
+        uint64_t gz_magic = 0;
+        int      gz_read  = gzread(gz_f, &gz_magic, sizeof(gz_magic));
+        assert(gz_read == sizeof(gz_magic) && gz_magic == 0x0016547846040010LL && "Expected valid Fuchsia trace header magic in gzip trace");
+        gzclose(gz_f);
+        std::remove(test_ftf_gz.c_str());
+        std::cout << "[TEST] Gzip compressed trace test passed!" << std::endl;
 
         // Test Per-TID Perfetto trace generation
         main_drawer.SetPerTidOutput(true);

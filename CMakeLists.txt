@@ -27,11 +27,13 @@ target_include_directories(ptgraph PRIVATE
 
 find_package(Threads REQUIRED)
 find_package(nlohmann_json 3.2.0 REQUIRED)
+find_package(ZLIB REQUIRED)
 
 target_link_libraries(ptgraph PRIVATE
     Threads::Threads
     rt
     nlohmann_json::nlohmann_json
+    ZLIB::ZLIB
 )
 
 target_compile_options(ptgraph PRIVATE
@@ -48,6 +50,7 @@ target_link_libraries(mperf PRIVATE
     Threads::Threads
     rt
     nlohmann_json::nlohmann_json
+    ZLIB::ZLIB
 )
 target_compile_options(mperf PRIVATE
     -Wall
@@ -62,6 +65,7 @@ target_link_libraries(test_shm PRIVATE
     Threads::Threads
     rt
     nlohmann_json::nlohmann_json
+    ZLIB::ZLIB
 )
 target_compile_options(test_shm PRIVATE
     -Wall
@@ -76,6 +80,7 @@ target_link_libraries(test_json PRIVATE
     Threads::Threads
     rt
     nlohmann_json::nlohmann_json
+    ZLIB::ZLIB
 )
 target_compile_options(test_json PRIVATE
     -Wall
