@@ -280,6 +280,7 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     ele.cpu       = sample->cpu >= 0 ? static_cast<uint16_t>(sample->cpu) : 0;
     ele.flags     = sample->flags;
 
+    // TODO: Consider 0x101, 0x201, Trace start, trace end
     // Determine FrameType from sample flags
     if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
         ele.type = FrameType::CALL;
@@ -348,20 +349,20 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     // - CALL: destination addr is callee being entered; ip is call site in caller
     // - RETURN: ip is returning callee; addr is return site in caller
     if (ele.type == FrameType::CALL) {
-        ele.ip         = sample->addr;
-        ele.caller_ip  = sample->ip;
+        ele.addr       = sample->addr;
+        ele.ip         = sample->ip;
         sym_str        = addr_sym;
         caller_sym_str = ip_sym;
         dso_str        = addr_dso.empty() ? ip_dso : addr_dso;
     } else if (ele.type == FrameType::RETURN) {
         ele.ip         = sample->ip;
-        ele.caller_ip  = sample->addr;
+        ele.addr       = sample->addr;
         sym_str        = ip_sym;
         caller_sym_str = addr_sym;
         dso_str        = ip_dso;
     } else {
         ele.ip         = sample->ip;
-        ele.caller_ip  = sample->addr;
+        ele.addr       = sample->addr;
         sym_str        = ip_sym;
         caller_sym_str = addr_sym;
         dso_str        = ip_dso;
@@ -855,10 +856,94 @@ namespace {
     {
         uint64_t    timestamp{0};
         uint64_t    ip{0};
-        uint64_t    caller_ip{0};
+        uint64_t    addr{0};
         std::string sym;
         std::string dso;
         std::string caller;
+    };
+
+    class Stack
+    {
+    public:
+        size_t Size() const
+        {
+            return frames_.size();
+        }
+
+        void Push(const std::shared_ptr<StackFrame> &frame)
+        {
+            frames_.push_back(frame);
+        }
+
+        std::shared_ptr<StackFrame> Pop()
+        {
+            if (!frames_.empty()) {
+                auto frame = std::make_shared<StackFrame>(frames_.back());
+                frames_.pop_back();
+                return frame;
+            }
+            return nullptr;
+        }
+
+        const std::shared_ptr<StackFrame> *Top() const
+        {
+            if (frames_.empty()) {
+                return nullptr;
+            }
+            return &frames_.back();
+        }
+
+        bool Empty() const
+        {
+            return frames_.empty();
+        }
+
+        void DumpStack() const
+        {
+            for (const auto &frame : frames_) {
+                std::cout << "IP: " << frame->ip << ", ADDR: " << frame->addr
+                          << ", SYM: " << frame->sym << ", DSO: " << frame->dso
+                          << ", CALLER: " << frame->caller << std::endl;
+            }
+        }
+
+        bool IsLastFrame(std::shared_ptr<std::string> sym, std::shared_ptr<std::string> dso=nullptr) const {
+            if (frames_.empty()) {
+                return false;
+            }
+            const auto &last_frame = frames_.back();
+            return last_frame->sym == *sym && (dso == nullptr || last_frame->dso == *dso);
+        }
+
+        std::shared_ptr<std::list<std::shared_ptr<StackFrame>>> SearchAndGetMatchedFrames(
+            std::shared_ptr<std::string> funcName, std::shared_ptr<std::string> funcCaller)
+        {
+            if (frames_.empty())
+                return nullptr;
+
+            // Search from back to front, so that the most recent matches are found first, get the position
+            auto pos = -1;
+            for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+                const auto &frame = *it;
+                if (frame->sym == *funcName && frame->caller == *funcCaller) {
+                    pos = std::distance(frames_.rbegin(), it);
+                    break;
+                }
+            }
+            if (pos == -1) {
+                return nullptr;
+            }
+
+            auto matched_frames = std::make_shared<std::list<std::shared_ptr<StackFrame>>>();
+            for (auto i = 0; i <= pos; ++i) {
+                matched_frames->push_back(frames_.back());
+                frames_.pop_back();
+            }
+            return matched_frames;
+        }
+
+    private:
+        std::vector<std::shared_ptr<StackFrame>> frames_;
     };
 
     inline std::string SanitizeSymbol(std::string s)
@@ -925,7 +1010,8 @@ namespace {
             return a.timestamp < b.timestamp;
         });
 
-        std::vector<StackFrame> stack;
+        std::shared_ptr<Stack> stack = std::make_shared<Stack>();
+
         uint64_t                last_seen_time = frames.back().timestamp;
         uint32_t                tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
 
@@ -955,17 +1041,19 @@ namespace {
 
             LOG_DEBUG << std::endl
                       << "-----------------------------------------------" << std::endl;
-            LOG_DEBUG << "[TID" << ele.tid << "] FrameEle: TS " << ele.timestamp << ", flags " << std::hex
-                      << ele.flags << std::dec << ", IP " << caller_sym_str << ", Addr " << sym_str << std::endl;
+            LOG_DEBUG << "[TID" << tid << "] FrameEle: TS " << ele.timestamp << ", flags " << std::hex
+                      << ele.flags << std::dec << ", CPU " << ele.cpu
+                      << ", caller " << caller_sym_str << ", callee " << sym_str << std::endl;
 
             if (sym_str.empty() && ele.ip) {
+                std::cout << "[TID " << tid << "] Empty sym_str for IP 0x" << std::hex << ele.ip << std::dec << std::endl;
                 char buf[32];
                 std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.ip));
                 sym_str = buf;
             }
-            if (caller_sym_str.empty() && ele.caller_ip) {
+            if (caller_sym_str.empty() && ele.addr) {
                 char buf[32];
-                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.caller_ip));
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.addr));
                 caller_sym_str = buf;
             }
             if (sym_str.empty())
@@ -980,20 +1068,20 @@ namespace {
                 if (json_para.frameFrontSkipping) {
                     bool skip = false;
                     for (const auto &rule : *json_para.frameFrontSkipping) {
-                        if (rule && rule->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                        if (rule && rule->Match(sym_str, dso_str, ele.ip, ele.addr)) {
                             skip = true;
                             break;
                         }
                     }
                     if (skip) {
-                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] Skip CALL frame: " << sym_str << std::endl;
+                        LOG_DEBUG << "[TID " << tid << "] Skip CALL frame: " << sym_str << std::endl;
                         continue;
                     }
                 }
 
                 if (json_para.frameFrontModification) {
                     for (const auto &pair : *json_para.frameFrontModification) {
-                        if (pair && pair->first && pair->first->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                        if (pair && pair->first && pair->first->Match(sym_str, dso_str, ele.ip, ele.addr)) {
                             if (pair->second) {
                                 if (pair->second->sym && !pair->second->sym->empty())
                                     sym_str = *pair->second->sym;
@@ -1005,13 +1093,23 @@ namespace {
                     }
                 }
 
-                stack.push_back({ele.timestamp, ele.ip, ele.caller_ip, sym_str, dso_str, caller_sym_str});
-                if (stack.size() > max_depth)
-                    max_depth = stack.size();
+                //
+                // TODO: Add support of JIT
+                // JIT
+                // Most likely the 'ret' in a JIT function will not be captured by intel_pt
+                // sym only is not nullptr when sample is 'SYSCALL' and 'TRACEDIS'
+                // if 'last symbol in stack' is JIT and current sample is NOT 'SYSCALL' or 'TRACEDIS',
+                // then close last frame before push the next one
 
-                LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] ++PUSH CALL: "
-                          << sym_str << " (caller: " << caller_sym_str << ", ts=" << ele.timestamp
-                          << ", dso=" << dso_str << ")" << std::endl;
+                //
+                // Normal case: push the current frame onto the stack
+                auto frame = std::make_shared<StackFrame>(
+                    StackFrame{ele.timestamp, ele.ip, ele.addr, sym_str, dso_str, caller_sym_str});
+                stack->Push(frame);
+                if (stack->Size() > max_depth)
+                    max_depth = stack->Size();
+
+                LOG_DEBUG << "[TID " << tid << "] ++PUSH CALL: " << sym_str << " (caller: " << caller_sym_str << ", ts=" << ele.timestamp << ", dso=" << dso_str << ")" << std::endl;
 
                 if (per_tid_mode && per_tid_writer) {
                     per_tid_writer->WriteFrameStart(ele.timestamp, pidtid, std::make_shared<std::string>(sym_str), 0);
@@ -1034,20 +1132,20 @@ namespace {
                 if (json_para.frameEndSkipping) {
                     bool skip = false;
                     for (const auto &rule : *json_para.frameEndSkipping) {
-                        if (rule && rule->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                        if (rule && rule->Match(sym_str, dso_str, ele.ip, ele.addr)) {
                             skip = true;
                             break;
                         }
                     }
                     if (skip) {
-                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] Skip RET frame: " << sym_str << std::endl;
+                        LOG_DEBUG << "[TID " << tid << "] Skip RET frame: " << sym_str << std::endl;
                         continue;
                     }
                 }
 
                 if (json_para.frameEndModification) {
                     for (const auto &pair : *json_para.frameEndModification) {
-                        if (pair && pair->first && pair->first->Match(sym_str, dso_str, ele.ip, ele.caller_ip)) {
+                        if (pair && pair->first && pair->first->Match(sym_str, dso_str, ele.ip, ele.addr)) {
                             if (pair->second) {
                                 if (pair->second->sym && !pair->second->sym->empty())
                                     sym_str = *pair->second->sym;
@@ -1059,8 +1157,29 @@ namespace {
                     }
                 }
 
+                // 
+                // `StackFrame` match logic, with priority of:
+                //
+                // 1. If the current dlframe matches the last frame in the stack
+                // 2. If the current dlframe matches any other frame in stack -> Several POP-Frames have lost, pop a list of frames until the match
+                // 3. If (next+1)th dlframe matches current last frame in stack -> Several Push-Frames have lost, insert full-perfetto-frames before insert the perfetto-frame.
+
+                if (stack->IsLastFrame(std::make_shared<std::string>(sym_str))) {
+                    // ---------------- 1 ---------------
+                    LOG_DEBUG << "[TID " << tid << "] Current frame matches the last frame in the stack: " << sym_str << std::endl;
+                    auto frame = stack->Pop();
+
+                } else {
+                    // ---------------- 2 ---------------
+                    auto frames = stack->SearchAndGetMatchedFrames(
+                        std::make_shared<std::string>(sym_str), std::make_shared<std::string>(caller_sym_str));
+                    if (frames != nullptr) {
+                        // Handle the case where matched frames are found
+                    }
+                }
+
                 int match_idx = -1;
-                if (!stack.empty() && stack.back().sym == sym_str) {
+                if (stack->IsLastFrame(std::make_shared<std::string>(sym_str))) {
                     match_idx = static_cast<int>(stack.size()) - 1;
                 } else {
                     for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {

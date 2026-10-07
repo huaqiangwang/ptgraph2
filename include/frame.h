@@ -68,7 +68,7 @@ struct alignas(8) FrameEle
 
     // Addressing
     uint64_t ip;        // Current instruction pointer (callee entry/address)
-    uint64_t caller_ip; // Call site / caller address
+    uint64_t addr; // Call site / caller address
 
     // String references ({shmid, offset}) into SHM string pools
     StringRef sym;        // Callee symbol
@@ -94,7 +94,7 @@ struct alignas(8) FrameEle
            << ", timestamp=" << timestamp
            << ", duration=" << duration
            << ", ip=0x" << std::hex << ip
-           << ", caller_ip=0x" << caller_ip << std::dec
+           << ", addr=0x" << addr << std::dec
            << ", sym={shm:" << static_cast<unsigned>(sym.shmid) << ", off:" << sym.offset << "}"
            << ", caller_sym={shm:" << static_cast<unsigned>(caller_sym.shmid) << ", off:" << caller_sym.offset << "}"
            << ", dso={shm:" << static_cast<unsigned>(dso.shmid) << ", off:" << dso.offset << "}"
@@ -139,7 +139,7 @@ public:
     uint64_t  GetTimestamp() const { return ele_.timestamp; }
     uint64_t  GetDuration() const { return ele_.duration; }
     uint64_t  GetIp() const { return ele_.ip; }
-    uint64_t  GetCallerIp() const { return ele_.caller_ip; }
+    uint64_t  GetAddr() const { return ele_.addr; }
     uint32_t  GetPid() const { return ele_.pid; }
     uint32_t  GetTid() const { return ele_.tid; }
     uint32_t  GetRank() const { return ele_.rank; }
