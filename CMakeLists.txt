@@ -12,6 +12,7 @@ set(SOURCES
     src/dlfilter.cpp
     src/graph.cpp
     src/perfetto.cpp
+    src/replay_matcher.cpp
 )
 
 add_library(ptgraph SHARED ${SOURCES})
@@ -42,7 +43,7 @@ target_compile_options(ptgraph PRIVATE
 )
 
 # mperf parallel multi-process launcher
-add_executable(mperf src/mperf.cpp src/graph.cpp src/perfetto.cpp)
+add_executable(mperf src/mperf.cpp src/graph.cpp src/perfetto.cpp src/replay_matcher.cpp)
 target_include_directories(mperf PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -57,7 +58,7 @@ target_compile_options(mperf PRIVATE
     -Wextra
 )
 
-add_executable(test_shm test/test_shm.cpp src/graph.cpp src/perfetto.cpp)
+add_executable(test_shm test/test_shm.cpp src/graph.cpp src/perfetto.cpp src/replay_matcher.cpp)
 target_include_directories(test_shm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -72,7 +73,7 @@ target_compile_options(test_shm PRIVATE
     -Wextra
 )
 
-add_executable(test_json test/test_json.cpp src/graph.cpp src/perfetto.cpp)
+add_executable(test_json test/test_json.cpp src/graph.cpp src/perfetto.cpp src/replay_matcher.cpp)
 target_include_directories(test_json PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -85,4 +86,24 @@ target_link_libraries(test_json PRIVATE
 target_compile_options(test_json PRIVATE
     -Wall
     -Wextra
+)
+
+add_executable(test_replay_matcher test/test_replay_matcher.cpp src/replay_matcher.cpp)
+target_include_directories(test_replay_matcher PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_options(test_replay_matcher PRIVATE
+    -Wall
+    -Wextra
+)
+
+add_custom_target(validate_real_perf
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/validate_real_perf.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/perf.data
+            $<TARGET_FILE:ptgraph>
+            ${CMAKE_CURRENT_SOURCE_DIR}/validation.ftf
+    DEPENDS ptgraph
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    USES_TERMINAL
 )

@@ -10,12 +10,14 @@
 // Frame type flags for call graph weaving
 enum class FrameType : uint8_t
 {
-    UNKNOWN = 0,
-    CALL    = 1, // Function entry / branch
-    RETURN  = 2, // Function exit
-    SAMPLE  = 3, // Standalone / sampling event
-    SYSCALL = 4, // System call entry/exit
-    MARKER  = 5  // Custom trigger / zone marker
+    UNKNOWN     = 0,
+    CALL        = 1, // Function entry / branch
+    RETURN      = 2, // Function exit
+    SAMPLE      = 3, // Standalone / sampling event
+    SYSCALL     = 4, // System call entry/exit
+    MARKER      = 5, // Custom trigger / zone marker
+    TRACE_BEGIN = 6, // Trace start / resume (0x101)
+    INTERRUPT   = 7  // Interrupt event / closure
 };
 
 inline const char *FrameTypeToString(FrameType type)
@@ -31,6 +33,10 @@ inline const char *FrameTypeToString(FrameType type)
         return "SYSCALL";
     case FrameType::MARKER:
         return "MARKER";
+    case FrameType::TRACE_BEGIN:
+        return "TRACE_BEGIN";
+    case FrameType::INTERRUPT:
+        return "INTERRUPT";
     case FrameType::UNKNOWN:
     default:
         return "UNKNOWN";
@@ -67,7 +73,7 @@ struct alignas(8) FrameEle
     uint64_t duration;  // Duration (end - start), or 0 if instantaneous
 
     // Addressing
-    uint64_t ip;        // Current instruction pointer (callee entry/address)
+    uint64_t ip;   // Current instruction pointer (callee entry/address)
     uint64_t addr; // Call site / caller address
 
     // String references ({shmid, offset}) into SHM string pools

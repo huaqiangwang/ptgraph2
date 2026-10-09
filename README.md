@@ -1,6 +1,6 @@
 # ptgraph2
 
-A high-performance Linux `perf` dynamic library filter (`dlfilter`) for extracting instruction trace samples (such as Intel PT), grouping frames per thread (`tid`), storing them in lock-free shared memory (`/dev/shm`), and aggregating distributed traces via MPI.
+A high-performance Linux `perf` dynamic library filter (`dlfilter`) and call-graph reconstruction engine for Intel PT (Processor Trace). It captures branch/call/return/interrupt events, segregates frames per thread (`tid`) in lock-free shared memory (`/dev/shm`), coordinates multi-process parallel decoding, and reconstructs robust timeline traces exported directly to the Perfetto format (`.ftf` / `.ftf.gz`).
 
 ---
 
@@ -10,44 +10,33 @@ A high-performance Linux `perf` dynamic library filter (`dlfilter`) for extracti
 - **TID-Segregated Lock-Free Shared Memory**:
   - Automatically isolates trace streams per `tid` (`/<prefix>_tid_<tid>_zone_<id>`), preventing data interleaving across threads.
   - Dynamically provisions consecutive SHM zones upon capacity exhaustion.
-  - Reader processes can consume frame queues concurrently without locks using atomic load-acquire and store-release synchronization.
+  - Reader processes consume frame queues concurrently without locks using atomic load-acquire and store-release synchronization.
 - **Global Deduplicated String Pool**:
   - DSOs and symbol strings are cached in dedicated SHM string zones (`/<prefix>_str_zone_<id>`).
   - Frames store lightweight `StringRef{shmid, offset}` references to avoid duplicate strings in memory.
-- **Master Catalog**:
-  - Maintains `/<prefix>_master` recording active `(pid, tid)` pairs, total frames written, and active zone status for external reader discovery.
-- **Distributed MPI Aggregation**:
-  - Initialized in `start()` and coordinated in `stop()`.
-  - Discovers and gathers all SHM zone descriptors across ranks with `MPI_Allgatherv`.
+- **Master Catalog & Multi-Process Coordinator**:
+  - Maintains `/<prefix>_master` recording active `(pid, tid)` pairs, total frames written, and active zone status.
+  - Coordinated via `ShmCoordinator` across parallel worker processes without external IPC dependencies.
+- **Multi-Process Parallel Acceleration (`mperf`)**:
+  - Automatically slices trace time intervals and launches parallel worker processes to decode large `perf.data` files concurrently.
+  - Rank 0 acts as the aggregator to assemble zones and generate unified timelines.
+- **Robust Call & Return Matching with Lookahead Recovery**:
+  - Resilient against trace drops, buffer overflows, tail-call optimizations, and runtime aliases.
+  - Uses LCS dynamic-programming lookahead (`ChooseReturnRecovery`) to arbitrate between missing CALLs and missing RETURNs.
+  - Preserves exact instruction retirement sequence across identical timestamps using stable sorting.
+  - Generates zero-duration `FULL` slices for isolated pre-trace returns without polluting call stack depth.
+- **Hardware Interrupt & Trace Resume Pairing**:
+  - Automatically correlates asynchronous interrupt events (`flags = 0x63`: `BRANCH | CALL | ASYNC | INTERRUPT`) with trace resumption (`flags = 0x101`: `TRACE_BEGIN | BRANCH`).
+  - Closes interrupt intervals cleanly as `[interrupt]` slices, preventing false stack explosions and eliminating trailing unclosed frames.
+- **Native Perfetto Timeline Export**:
+  - Generates Fuchsia Trace Format (`.ftf`) files compatible with [ui.perfetto.dev](https://ui.perfetto.dev).
+  - Built-in multi-threaded timeline replay and streaming Gzip compression (`.ftf.gz`).
+  - Supports unified single traces or per-TID output (`out_tid_<tid>.ftf`).
 - **JSON-Driven Filtering & Weaving**:
   - Supports function window filtering (`funcZone` trigger on begin/end functions).
   - Supports timestamp window filtering (`timeZone`).
   - Supports frame index slicing (`frameZone`).
-  - Supports symbol and DSO skipping / replacement (`frameFrontSkipping`, `frameEndSkipping`, `modification`).
-
----
-
-## Project Structure
-
-```text
-ptgraph2/
-├── CMakeLists.txt          # Build configuration (C++17, MPI, nlohmann_json)
-├── conf/
-│   └── ptgraph.json        # Example JSON configuration for filtering
-├── include/
-│   ├── frame.h             # FrameEle, FrameType, StringRef, and dump()
-│   ├── graph.h             # GraphDrawer & PtGraphReader class declarations
-│   ├── json.h              # JSON configuration parsing
-│   ├── log.h               # Leveled logging macros (LOG_INFO, LOG_DEBUG, etc.)
-│   ├── perf_dlfilter.h     # Linux perf dlfilter C API definitions
-│   └── shm.h               # SHM layout headers and structures
-├── src/
-│   ├── dlfilter.cpp        # perf dlfilter entry points (start, filter_event, stop)
-│   └── graph.cpp           # GraphDrawer and PtGraphReader implementations
-└── test/
-    ├── test_json.cpp       # Unit tests for JSON config filtering
-    └── test_shm.cpp        # Tests for multi-TID SHM queues and MPI zone gathering
-```
+  - Supports symbol and DSO skipping / replacement (`frameFrontSkipping`, `frameEndSkipping`, `modification`, `endFramePair`).
 
 ---
 
@@ -55,14 +44,14 @@ ptgraph2/
 
 - **C++17 Compiler**: GCC $\ge$ 9 or Clang $\ge$ 10
 - **CMake**: $\ge$ 3.10
-- **Linux perf**: Tool with `dlfilter` support (kernel $\ge$ 5.14 recommended)
-- **MPI**: OpenMPI or MPICH (`libopenmpi-dev`, `openmpi-bin`)
+- **Linux perf**: Tool with `dlfilter` support (Linux kernel $\ge$ 5.14 recommended)
+- **ZLIB**: `zlib1g-dev`
 - **nlohmann_json**: `nlohmann-json3-dev` ($\ge$ 3.2.0)
 
 Install dependencies on Ubuntu / Debian:
 ```bash
 sudo apt-get update
-sudo apt-get install -y cmake build-essential libopenmpi-dev openmpi-bin nlohmann-json3-dev linux-tools-generic
+sudo apt-get install -y cmake build-essential zlib1g-dev nlohmann-json3-dev linux-tools-generic
 ```
 
 ---
@@ -70,89 +59,43 @@ sudo apt-get install -y cmake build-essential libopenmpi-dev openmpi-bin nlohman
 ## Building
 
 ```bash
-mkdir -p build
 cmake -B build -S .
-cmake --build build
+cmake --build build -j
 ```
-
-Artifacts generated in `build/`:
-- `build/lib/libptgraph.so`: The shared library passed to `perf script --dlfilter`.
-- `build/test_shm`: Test binary for multi-TID SHM streaming and MPI gathering.
-- `build/test_json`: Test binary for JSON configuration parsing and filtering.
-
 ---
 
-## Running Tests
+## Usage
 
-### 1. Unit Tests for JSON Filtering
+### 1. Record an Intel PT Trace
+Record instruction branches of your workload:
 ```bash
-./build/test_json
+perf record -e intel_pt//u -- ./my_target_app
 ```
 
-### 2. Multi-TID SHM Tests (Single Rank)
+### 2. Run with `mperf` (Parallel Multi-Process Acceleration)
+`mperf` partitions the trace time window across $N$ worker processes:
 ```bash
-./build/test_shm
+./build/mperf -i perf.data -n 4 -f out.ftf -j conf/ptgraph.json
 ```
 
-### 3. Distributed MPI Gathering (Multi-Rank)
+Options:
+- `-i <file>`: Input `perf.data` file (default: `perf.data`).
+- `-n <num>`: Number of parallel `perf script` worker processes (default: `4`).
+- `-f <file>`: Output Perfetto trace file (default: `out.ftf`, automatically generates `out.ftf.gz`).
+- `-j <file>`: Configuration JSON file.
+- `-P`: Generate per-TID Perfetto trace files (`out_tid_<tid>.ftf`).
+- `-v`: Enable verbose debug logging.
+
+### 3. Run Standalone with Linux `perf script`
+Alternatively, invoke `perf script` directly with the dlfilter:
 ```bash
-mpirun -n 3 ./build/test_shm
+perf script -i perf.data --itrace=cr \
+    --dlfilter build/lib/libptgraph.so \
+    --dlarg "-f out.ftf -j conf/ptgraph.json"
 ```
 
----
-
-## Usage with Linux `perf`
-
-### 1. Record Intel PT Trace
-Record instructions of a workload:
-```bash
-perf record -e intel_pt//u -- filter ./my_target_app
-```
-
-### 2. Run with `ptgraph` Filter
-Use `perf script` with the built dlfilter:
-```bash
-perf script --itrace=bcr --dlfilter build/lib/libptgraph.so --dlarg "conf=conf/ptgraph.json"
-```
-
-### 3. Read Frames from Shared Memory in an External Consumer
-External processes can attach to the master catalog and read thread frames directly without copying:
-
-```cpp
-#include "graph.h"
-
-int main() {
-    PtGraphReader reader("ptgraph");
-    if (!reader.OpenMaster()) {
-        std::cerr << "Master catalog not found." << std::endl;
-        return 1;
-    }
-
-    // Inspect registered threads
-    for (const auto &entry : reader.GetThreadEntries()) {
-        std::cout << "PID: " << entry.pid << ", TID: " << entry.tid
-                  << ", Total Frames: " << entry.total_frames << std::endl;
-
-        // Fetch all frames for this thread
-        auto frames = reader.ReadAllFramesForThread(entry.tid);
-        for (const auto &f : frames) {
-            const char *sym = reader.ResolveString(f.sym);
-            std::cout << "  IP: 0x" << std::hex << f.ip << " -> " << sym << std::dec << std::endl;
-        }
-    }
-    return 0;
-}
-```
-
----
-
-## Shared Memory Layout
-
-| SHM Name Pattern | Description | Header Structure |
-| :--- | :--- | :--- |
-| `/<prefix>_master` | Registry table mapping all tracked `(pid, tid)` streams | `ShmMasterHeader` |
-| `/<prefix>_str_zone_<id>` | Global string pool storing deduplicated symbols and DSOs | `ShmStringZoneHeader` |
-| `/<prefix>_tid_<tid>_zone_<id>` | Dedicated `FrameEle` queue for thread `<tid>` | `ShmThreadZoneHeader` |
+### 4. View Trace in Perfetto UI
+Open [https://ui.perfetto.dev](https://ui.perfetto.dev) in Chrome or Edge and drag-and-drop the generated `out.ftf` or `out.ftf.gz` file.
 
 ---
 

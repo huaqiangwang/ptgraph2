@@ -1,5 +1,6 @@
 #include "graph.h"
 #include "perfetto.h"
+#include "replay_matcher.h"
 
 #include <algorithm>
 #include <atomic>
@@ -280,9 +281,12 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     ele.cpu       = sample->cpu >= 0 ? static_cast<uint16_t>(sample->cpu) : 0;
     ele.flags     = sample->flags;
 
-    // TODO: Consider 0x101, 0x201, Trace start, trace end
+    constexpr uint32_t FLAG_TRACE_BEGIN = PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH; // 0x101
+
     // Determine FrameType from sample flags
-    if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
+    if ((sample->flags & (PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH)) == FLAG_TRACE_BEGIN) {
+        ele.type = FrameType::TRACE_BEGIN;
+    } else if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
         ele.type = FrameType::CALL;
     } else if (sample->flags & PERF_DLFILTER_FLAG_RETURN) {
         ele.type = FrameType::RETURN;
@@ -360,6 +364,12 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         sym_str        = ip_sym;
         caller_sym_str = addr_sym;
         dso_str        = ip_dso;
+    } else if (ele.type == FrameType::TRACE_BEGIN) {
+        ele.ip         = sample->ip;
+        ele.addr       = sample->addr;
+        sym_str        = addr_sym.empty() ? ip_sym : addr_sym;
+        caller_sym_str = ip_sym;
+        dso_str        = addr_dso.empty() ? ip_dso : addr_dso;
     } else {
         ele.ip         = sample->ip;
         ele.addr       = sample->addr;
@@ -367,7 +377,8 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         caller_sym_str = addr_sym;
         dso_str        = ip_dso;
     }
-    LOG_TRACE << ", IP " << ip_sym << ", Addr " << addr_sym << ", DSO " << dso_str << std::endl;
+    LOG_TRACE << ", IP " << ip_sym << ", Addr " << addr_sym << ", DSO " << dso_str << ", flags 0x"
+              << std::hex << sample->flags << std::dec << std::endl;
 
     // Check funcZone filtering
     if (json_para_.funcZone) {
@@ -860,90 +871,8 @@ namespace {
         std::string sym;
         std::string dso;
         std::string caller;
-    };
-
-    class Stack
-    {
-    public:
-        size_t Size() const
-        {
-            return frames_.size();
-        }
-
-        void Push(const std::shared_ptr<StackFrame> &frame)
-        {
-            frames_.push_back(frame);
-        }
-
-        std::shared_ptr<StackFrame> Pop()
-        {
-            if (!frames_.empty()) {
-                auto frame = std::make_shared<StackFrame>(frames_.back());
-                frames_.pop_back();
-                return frame;
-            }
-            return nullptr;
-        }
-
-        const std::shared_ptr<StackFrame> *Top() const
-        {
-            if (frames_.empty()) {
-                return nullptr;
-            }
-            return &frames_.back();
-        }
-
-        bool Empty() const
-        {
-            return frames_.empty();
-        }
-
-        void DumpStack() const
-        {
-            for (const auto &frame : frames_) {
-                std::cout << "IP: " << frame->ip << ", ADDR: " << frame->addr
-                          << ", SYM: " << frame->sym << ", DSO: " << frame->dso
-                          << ", CALLER: " << frame->caller << std::endl;
-            }
-        }
-
-        bool IsLastFrame(std::shared_ptr<std::string> sym, std::shared_ptr<std::string> dso=nullptr) const {
-            if (frames_.empty()) {
-                return false;
-            }
-            const auto &last_frame = frames_.back();
-            return last_frame->sym == *sym && (dso == nullptr || last_frame->dso == *dso);
-        }
-
-        std::shared_ptr<std::list<std::shared_ptr<StackFrame>>> SearchAndGetMatchedFrames(
-            std::shared_ptr<std::string> funcName, std::shared_ptr<std::string> funcCaller)
-        {
-            if (frames_.empty())
-                return nullptr;
-
-            // Search from back to front, so that the most recent matches are found first, get the position
-            auto pos = -1;
-            for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
-                const auto &frame = *it;
-                if (frame->sym == *funcName && frame->caller == *funcCaller) {
-                    pos = std::distance(frames_.rbegin(), it);
-                    break;
-                }
-            }
-            if (pos == -1) {
-                return nullptr;
-            }
-
-            auto matched_frames = std::make_shared<std::list<std::shared_ptr<StackFrame>>>();
-            for (auto i = 0; i <= pos; ++i) {
-                matched_frames->push_back(frames_.back());
-                frames_.pop_back();
-            }
-            return matched_frames;
-        }
-
-    private:
-        std::vector<std::shared_ptr<StackFrame>> frames_;
+        uint32_t    flags{0};
+        size_t      start_event_idx{0};
     };
 
     inline std::string SanitizeSymbol(std::string s)
@@ -955,12 +884,51 @@ namespace {
         return s;
     }
 
+    constexpr size_t MAX_MATCH_LOOKAHEAD = 16;
+
+    std::string ReturnSymbol(const FrameEle          &frame,
+                             const ShmStringResolver &resolver,
+                             const JsonPara          &json_para)
+    {
+        std::string sym = resolver.Resolve(frame.rank, frame.sym);
+        if (sym.empty() && frame.ip) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(frame.ip));
+            sym = buf;
+        }
+        if (sym.empty())
+            sym = "[unknown]";
+        sym = SanitizeSymbol(sym);
+
+        if (json_para.endFramePair) {
+            for (const auto &pair : *json_para.endFramePair) {
+                if (pair && pair->got && pair->replace && sym == *pair->got) {
+                    sym = *pair->replace;
+                    break;
+                }
+            }
+        }
+        return sym;
+    }
+
+    std::vector<std::string> FutureReturnSymbols(const std::vector<FrameEle> &frames,
+                                                 size_t                       current_idx,
+                                                 const ShmStringResolver     &resolver,
+                                                 const JsonPara              &json_para)
+    {
+        std::vector<std::string> result;
+        for (size_t i = current_idx + 1; i < frames.size() && result.size() < MAX_MATCH_LOOKAHEAD; ++i) {
+            if (frames[i].type == FrameType::RETURN) {
+                result.push_back(ReturnSymbol(frames[i], resolver, json_para));
+            }
+        }
+        return result;
+    }
+
     void ReplayOneThread(uint64_t                              pidtid,
                          const std::vector<ShmZoneDescriptor> &thread_descs,
                          const ShmStringResolver              &resolver,
                          const JsonPara                       &json_para,
-                         bool                                  per_tid_mode,
-                         Perfetto                             *per_tid_writer,
                          std::vector<TimelineEvent>           &out_events,
                          const std::function<void(uint64_t)>  &on_progress = nullptr,
                          std::mutex                           *log_mutex   = nullptr)
@@ -1005,28 +973,32 @@ namespace {
         if (frames.empty())
             return;
 
-        // Ensure strictly chronological ordering
-        std::sort(frames.begin(), frames.end(), [](const FrameEle &a, const FrameEle &b) {
+        // Ensure strictly chronological ordering while preserving arrival sequence for equal timestamps
+        std::stable_sort(frames.begin(), frames.end(), [](const FrameEle &a, const FrameEle &b) {
             return a.timestamp < b.timestamp;
         });
 
-        std::shared_ptr<Stack> stack = std::make_shared<Stack>();
+        std::vector<StackFrame> stack;
 
-        uint64_t                last_seen_time = frames.back().timestamp;
-        uint32_t                tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
+        uint64_t last_seen_time = frames.back().timestamp;
+        uint32_t tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
 
         uint64_t calls_count          = 0;
         uint64_t rets_count           = 0;
         uint64_t exact_match_count    = 0;
         uint64_t deep_match_count     = 0;
+        uint64_t missing_call_count   = 0;
         uint64_t fallback_match_count = 0;
+        uint64_t recovered_ret_count  = 0;
         uint64_t empty_rets_count     = 0;
         uint64_t syscalls_count       = 0;
+        uint64_t interrupts_count     = 0;
         uint64_t tail_pops_count      = 0;
         size_t   max_depth            = 0;
         uint64_t local_count          = 0;
 
-        for (const auto &ele : frames) {
+        for (size_t frame_idx = 0; frame_idx < frames.size(); ++frame_idx) {
+            const auto &ele            = frames[frame_idx];
             std::string sym_str        = resolver.Resolve(ele.rank, ele.sym);
             std::string caller_sym_str = resolver.Resolve(ele.rank, ele.caller_sym);
             std::string dso_str        = resolver.Resolve(ele.rank, ele.dso);
@@ -1103,19 +1075,14 @@ namespace {
 
                 //
                 // Normal case: push the current frame onto the stack
-                auto frame = std::make_shared<StackFrame>(
-                    StackFrame{ele.timestamp, ele.ip, ele.addr, sym_str, dso_str, caller_sym_str});
-                stack->Push(frame);
-                if (stack->Size() > max_depth)
-                    max_depth = stack->Size();
+                size_t start_event_idx = out_events.size();
+                stack.push_back({ele.timestamp, ele.ip, ele.addr, sym_str, dso_str, caller_sym_str, ele.flags, start_event_idx});
+                if (stack.size() > max_depth)
+                    max_depth = stack.size();
 
                 LOG_DEBUG << "[TID " << tid << "] ++PUSH CALL: " << sym_str << " (caller: " << caller_sym_str << ", ts=" << ele.timestamp << ", dso=" << dso_str << ")" << std::endl;
 
-                if (per_tid_mode && per_tid_writer) {
-                    per_tid_writer->WriteFrameStart(ele.timestamp, pidtid, std::make_shared<std::string>(sym_str), 0);
-                } else {
-                    out_events.push_back({TimelineEventType::START, ele.timestamp, 0, pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
-                }
+                out_events.push_back({TimelineEventType::START, ele.timestamp, 0, pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
             } else if (ele.type == FrameType::RETURN) {
                 rets_count++;
                 sym_str = SanitizeSymbol(sym_str);
@@ -1157,48 +1124,53 @@ namespace {
                     }
                 }
 
-                // 
-                // `StackFrame` match logic, with priority of:
-                //
-                // 1. If the current dlframe matches the last frame in the stack
-                // 2. If the current dlframe matches any other frame in stack -> Several POP-Frames have lost, pop a list of frames until the match
-                // 3. If (next+1)th dlframe matches current last frame in stack -> Several Push-Frames have lost, insert full-perfetto-frames before insert the perfetto-frame.
-
-                if (stack->IsLastFrame(std::make_shared<std::string>(sym_str))) {
-                    // ---------------- 1 ---------------
-                    LOG_DEBUG << "[TID " << tid << "] Current frame matches the last frame in the stack: " << sym_str << std::endl;
-                    auto frame = stack->Pop();
-
-                } else {
-                    // ---------------- 2 ---------------
-                    auto frames = stack->SearchAndGetMatchedFrames(
-                        std::make_shared<std::string>(sym_str), std::make_shared<std::string>(caller_sym_str));
-                    if (frames != nullptr) {
-                        // Handle the case where matched frames are found
-                    }
+                std::vector<ReplayStackEntry> stack_top_first;
+                size_t                        stack_depth = std::min(stack.size(), MAX_MATCH_LOOKAHEAD);
+                stack_top_first.reserve(stack_depth);
+                for (size_t i = 0; i < stack_depth; ++i) {
+                    const auto &frame = stack[stack.size() - 1 - i];
+                    stack_top_first.push_back({frame.sym, frame.caller});
                 }
 
-                int match_idx = -1;
-                if (stack->IsLastFrame(std::make_shared<std::string>(sym_str))) {
-                    match_idx = static_cast<int>(stack.size()) - 1;
-                } else {
-                    for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
-                        if (stack[i].sym == sym_str) {
-                            match_idx = i;
-                            break;
-                        }
-                    }
+                auto future_returns = FutureReturnSymbols(frames, frame_idx, resolver, json_para);
+                auto decision       = ChooseReturnRecovery(stack_top_first, sym_str, caller_sym_str,
+                                                           future_returns, MAX_MATCH_LOOKAHEAD);
+                if (!stack.empty() && decision.pop_count != 1) {
+                    LOG_DEBUG << "[TID " << tid << "] RET mismatch: " << sym_str
+                              << ", keep score=" << decision.keep_score
+                              << ", pop score=" << decision.pop_score
+                              << ", decision=" << (decision.keep_stack ? "missing CALL" : "missing RETURN(s)")
+                              << std::endl;
                 }
 
-                if (match_idx >= 0) {
-                    size_t num_popped = stack.size() - match_idx;
-                    if (num_popped == 1) {
+                if (decision.keep_stack) {
+                    if (stack.empty()) {
+                        empty_rets_count++;
+                        LOG_DEBUG << "[TID " << tid << "] RET isolated (empty stack, called pre-trace): "
+                                  << sym_str << " (ts=" << ele.timestamp << "), instantaneous closure" << std::endl;
+                    } else {
+                        missing_call_count++;
+                        LOG_DEBUG << "[TID " << tid << "] RET isolated (missing CALL): "
+                                  << sym_str << " (ts=" << ele.timestamp << "), instantaneous closure" << std::endl;
+                    }
+                    // Instantaneous closure for isolated RETURN
+                    out_events.push_back({TimelineEventType::FULL, ele.timestamp, ele.timestamp,
+                                          pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
+                    continue;
+                }
+
+                if (decision.pop_count > 0) {
+                    size_t num_popped = decision.pop_count;
+                    if (decision.fallback_pop) {
+                        fallback_match_count++;
+                    } else if (num_popped == 1) {
                         exact_match_count++;
                     } else {
                         deep_match_count++;
+                        recovered_ret_count += num_popped - 1;
                     }
 
-                    while (static_cast<int>(stack.size()) > match_idx) {
+                    for (size_t i = 0; i < num_popped; ++i) {
                         auto popped = stack.back();
                         stack.pop_back();
 
@@ -1206,38 +1178,38 @@ namespace {
                         LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP RET: "
                                   << popped.sym << " (matched " << sym_str << ", dur=" << dur << " ns)" << std::endl;
 
-                        if (per_tid_mode && per_tid_writer) {
-                            per_tid_writer->WriteFrameEnd(ele.timestamp, pidtid, popped.timestamp,
-                                                          std::make_shared<std::string>(popped.dso),
-                                                          std::make_shared<std::string>(popped.sym), 0);
-                        } else {
-                            out_events.push_back({TimelineEventType::END, ele.timestamp, popped.timestamp,
-                                                  pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
-                        }
-                    }
-                } else if (!stack.empty()) {
-                    // Fallback pop: top frame returned under compiler clone/alias or missing return
-                    fallback_match_count++;
-                    auto popped = stack.back();
-                    stack.pop_back();
-
-                    uint64_t dur = ele.timestamp >= popped.timestamp ? (ele.timestamp - popped.timestamp) : 0;
-                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP RET [FALLBACK]: "
-                              << popped.sym << " (target was " << sym_str << ", dur=" << dur << " ns)" << std::endl;
-
-                    if (per_tid_mode && per_tid_writer) {
-                        per_tid_writer->WriteFrameEnd(ele.timestamp, pidtid, popped.timestamp,
-                                                      std::make_shared<std::string>(popped.dso),
-                                                      std::make_shared<std::string>(popped.sym), 0);
-                    } else {
                         out_events.push_back({TimelineEventType::END, ele.timestamp, popped.timestamp,
                                               pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
                     }
-                } else {
-                    // Stack is empty: function started before trace window
-                    empty_rets_count++;
-                    LOG_DEBUG << "[TID " << tid << "] RET ignored (empty stack, called pre-trace): "
-                              << sym_str << " (ts=" << ele.timestamp << ")" << std::endl;
+                }
+            } else if (ele.type == FrameType::TRACE_BEGIN ||
+                       ((ele.flags & (PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH)) ==
+                        (PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH))) {
+                constexpr uint32_t FLAG_INTERRUPT = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL |
+                                                    PERF_DLFILTER_FLAG_ASYNC | PERF_DLFILTER_FLAG_INTERRUPT; // 0x63
+                if (!stack.empty() &&
+                    ((stack.back().flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || stack.back().flags == FLAG_INTERRUPT)) {
+                    auto popped = stack.back();
+                    stack.pop_back();
+
+                    interrupts_count++;
+                    if (calls_count > 0) {
+                        calls_count--;
+                    }
+                    uint64_t dur = ele.timestamp >= popped.timestamp ? (ele.timestamp - popped.timestamp) : 0;
+
+                    std::string irq_sym = "[interrupt]";
+
+                    // Mark the start event as interrupt
+                    if (popped.start_event_idx < out_events.size()) {
+                        out_events[popped.start_event_idx].sym = irq_sym;
+                    }
+
+                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
+                              << irq_sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+
+                    out_events.push_back({TimelineEventType::END, ele.timestamp, popped.timestamp,
+                                          pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
                 }
             } else if (ele.type == FrameType::SYSCALL) {
                 syscalls_count++;
@@ -1246,14 +1218,8 @@ namespace {
                 LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() << "] SYSCALL: "
                           << sym_str << " (dur=" << (end_time - ele.timestamp) << " ns)" << std::endl;
 
-                if (per_tid_mode && per_tid_writer) {
-                    per_tid_writer->WriteFrameFull(ele.timestamp, end_time, pidtid,
-                                                   std::make_shared<std::string>(dso_str),
-                                                   std::make_shared<std::string>(sym_str), 0);
-                } else {
-                    out_events.push_back({TimelineEventType::FULL, end_time, ele.timestamp,
-                                          pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
-                }
+                out_events.push_back({TimelineEventType::FULL, end_time, ele.timestamp,
+                                      pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
             }
         }
 
@@ -1271,14 +1237,8 @@ namespace {
             LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] Tail pop unclosed frame: "
                       << popped.sym << " (dur=" << (end_time - popped.timestamp) << " ns)" << std::endl;
 
-            if (per_tid_mode && per_tid_writer) {
-                per_tid_writer->WriteFrameEnd(end_time, pidtid, popped.timestamp,
-                                              std::make_shared<std::string>(popped.dso),
-                                              std::make_shared<std::string>(popped.sym), 0);
-            } else {
-                out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
-                                      pidtid, popped.sym, popped.dso, popped.caller, 0});
-            }
+            out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                  pidtid, popped.sym, popped.dso, popped.caller, 0});
         }
 
         if (log_mutex) {
@@ -1290,8 +1250,12 @@ namespace {
         LOG_INFO << "[ptgraph] Thread " << tid << " replay summary: " << frames.size() << " frames ("
                  << calls_count << " calls, " << rets_count << " rets ["
                  << exact_match_count << " exact, " << deep_match_count << " deep, "
-                 << fallback_match_count << " fallback, " << empty_rets_count << " pre-trace empty], "
-                 << syscalls_count << " syscalls, " << tail_pops_count << " tail pops, max stack depth: "
+                 << recovered_ret_count << " recovered missing returns, "
+                 << missing_call_count << " missing calls, " << fallback_match_count << " fallback, "
+                 << empty_rets_count << " pre-trace empty], "
+                 << syscalls_count << " syscalls, "
+                 << interrupts_count << " interrupts, "
+                 << tail_pops_count << " tail pops, max stack depth: "
                  << max_depth << ")" << std::endl;
         if (log_mutex) {
             log_mutex->unlock();
@@ -1435,22 +1399,29 @@ void GraphDrawer::GeneratePerfettoTrace(const std::string &outfile, const std::v
                 uint32_t pid    = static_cast<uint32_t>(pidtid >> 32);
                 uint32_t tid    = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
 
-                std::unique_ptr<Perfetto> per_tid_writer = nullptr;
-                if (is_per_tid) {
-                    std::string fname = "out_tid_" + std::to_string(tid) + ".ftf";
-                    per_tid_writer    = std::make_unique<Perfetto>(fname);
-                    std::string pcomm = pid_to_comm[pid];
-                    std::string tcomm = tid_to_comm[pidtid];
-                    per_tid_writer->WriteProcessRecord(pid, std::make_shared<std::string>(pcomm));
-                    per_tid_writer->WriteThreadNameRecord(pid, tid, std::make_shared<std::string>(tcomm));
-                }
-
                 ReplayOneThread(pidtid, thread_zones_map[pidtid], resolver, json_para_,
-                                is_per_tid, per_tid_writer.get(), per_thread_results[idx],
+                                per_thread_results[idx],
                                 on_replay_progress, &replay_progress_mutex);
 
-                if (per_tid_writer) {
-                    per_tid_writer->Flush();
+                if (is_per_tid) {
+                    Perfetto writer("out_tid_" + std::to_string(tid) + ".ftf");
+                    writer.WriteProcessRecord(pid, std::make_shared<std::string>(pid_to_comm[pid]));
+                    writer.WriteThreadNameRecord(pid, tid, std::make_shared<std::string>(tid_to_comm[pidtid]));
+                    for (const auto &event : per_thread_results[idx]) {
+                        if (event.type == TimelineEventType::START) {
+                            writer.WriteFrameStart(event.timestamp, event.pidtid,
+                                                   std::make_shared<std::string>(event.sym), 0);
+                        } else if (event.type == TimelineEventType::END) {
+                            writer.WriteFrameEnd(event.timestamp, event.pidtid, event.start_timestamp,
+                                                 std::make_shared<std::string>(event.dso),
+                                                 std::make_shared<std::string>(event.sym), 0);
+                        } else {
+                            writer.WriteFrameFull(event.start_timestamp, event.timestamp, event.pidtid,
+                                                  std::make_shared<std::string>(event.dso),
+                                                  std::make_shared<std::string>(event.sym), 0);
+                        }
+                    }
+                    writer.Flush();
                 }
             }
         });
