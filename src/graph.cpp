@@ -286,6 +286,8 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     // Determine FrameType from sample flags
     if (sample->flags & PERF_DLFILTER_FLAG_TRACE_BEGIN) {
         ele.type = FrameType::TRACE_BEGIN;
+    } else if ((sample->flags & 0x60) == 0x40) {
+        ele.type = FrameType::INTERRUPT;
     } else if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
         ele.type = FrameType::CALL;
     } else if (sample->flags & PERF_DLFILTER_FLAG_RETURN) {
@@ -351,14 +353,14 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
 
     // Distinguish CALL vs RETURN callee/caller roles:
     // - CALL: destination addr is callee being entered; ip is call site in caller
-    // - RETURN: ip is returning callee; addr is return site in caller
+    // - RETURN / INTERRUPT exit: ip is returning callee; addr is return site in caller
     if (ele.type == FrameType::CALL) {
         ele.addr       = sample->addr;
         ele.ip         = sample->ip;
         sym_str        = addr_sym;
         caller_sym_str = ip_sym;
         dso_str        = addr_dso.empty() ? ip_dso : addr_dso;
-    } else if (ele.type == FrameType::RETURN) {
+    } else if (ele.type == FrameType::RETURN || ele.type == FrameType::INTERRUPT) {
         ele.ip         = sample->ip;
         ele.addr       = sample->addr;
         sym_str        = ip_sym;
@@ -411,7 +413,7 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
             }
         }
     }
-    if (json_para_.frameEndSkipping && (sample->flags & PERF_DLFILTER_FLAG_RETURN)) {
+    if (json_para_.frameEndSkipping && (sample->flags & PERF_DLFILTER_FLAG_RETURN) && ((sample->flags & 0x60) != 0x40)) {
         for (const auto &skip_rule : *json_para_.frameEndSkipping) {
             if (skip_rule && skip_rule->Match(sym_str, dso_str, sample->ip, sample->addr)) {
                 return;
@@ -923,6 +925,9 @@ namespace {
                  (frames[i].flags & PERF_DLFILTER_FLAG_TRACE_BEGIN))) {
                 break;
             }
+            if ((frames[i].flags & 0x60) == 0x40 || frames[i].type == FrameType::INTERRUPT) {
+                continue;
+            }
             if (frames[i].type == FrameType::RETURN) {
                 result.push_back(ReturnSymbol(frames[i], resolver, json_para));
             }
@@ -1048,7 +1053,76 @@ namespace {
             if (caller_sym_str.empty())
                 caller_sym_str = "[unknown]";
 
-            if (ele.type == FrameType::CALL || (ele.flags & PERF_DLFILTER_FLAG_CALL)) {
+            // Check for Interrupt exit (flags with bit 0x40 and not 0x20, e.g. 0x45)
+            if ((ele.flags & 0x60) == 0x40 || ele.type == FrameType::INTERRUPT) {
+                after_trace_begin = false;
+                sym_str           = SanitizeSymbol(sym_str);
+
+                // Find the innermost interrupt entry frame (flags with bit 0x60 == 0x60)
+                int irq_idx = -1;
+                for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
+                    if ((stack[i].flags & 0x60) == 0x60) {
+                        irq_idx = i;
+                        break;
+                    }
+                }
+
+                if (irq_idx >= 0) {
+                    // Close all intermediate events pushed inside this interrupt
+                    while (static_cast<int>(stack.size()) > irq_idx + 1) {
+                        auto child = stack.back();
+                        stack.pop_back();
+
+                        uint64_t end_time = ele.timestamp >= child.timestamp ? ele.timestamp : child.timestamp;
+                        uint64_t dur      = end_time - child.timestamp;
+                        recovered_ret_count++;
+
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT CHILD: "
+                                  << child.sym << " (dur=" << dur << " ns, started at " << child.timestamp << ")" << std::endl;
+
+                        out_events.push_back({TimelineEventType::END, end_time, child.timestamp,
+                                              pidtid, child.sym, child.dso, child.caller, ele.cpu});
+                    }
+
+                    // Close the interrupt entry frame itself
+                    auto irq_frame = stack.back();
+                    stack.pop_back();
+
+                    interrupts_count++;
+                    if (calls_count > 0) {
+                        calls_count--;
+                    }
+
+                    uint64_t end_time = ele.timestamp >= irq_frame.timestamp ? ele.timestamp : irq_frame.timestamp;
+                    uint64_t dur      = end_time - irq_frame.timestamp;
+
+                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
+                              << irq_frame.sym << " (dur=" << dur << " ns, started at " << irq_frame.timestamp << ")" << std::endl;
+
+                    out_events.push_back({TimelineEventType::END, end_time, irq_frame.timestamp,
+                                          pidtid, irq_frame.sym, irq_frame.dso, irq_frame.caller, ele.cpu});
+                } else {
+                    // Isolated 0x45 with no matching 0x63 entry on the stack
+                    if (stack.empty()) {
+                        empty_rets_count++;
+                        uint64_t start_time = has_trace_begin ? last_trace_begin_time : ele.timestamp;
+                        if (start_time > ele.timestamp) {
+                            start_time = ele.timestamp;
+                        }
+                        LOG_DEBUG << "[TID " << tid << "] INTERRUPT EXIT isolated (empty stack): "
+                                  << sym_str << " (start_ts=" << start_time << ", end_ts=" << ele.timestamp
+                                  << ", dur=" << (ele.timestamp - start_time) << " ns)" << std::endl;
+                        out_events.push_back({TimelineEventType::FULL, ele.timestamp, start_time,
+                                              pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
+                    } else {
+                        missing_call_count++;
+                        LOG_DEBUG << "[TID " << tid << "] INTERRUPT EXIT isolated (no 0x63 on stack): "
+                                  << sym_str << " (ts=" << ele.timestamp << ")" << std::endl;
+                        out_events.push_back({TimelineEventType::FULL, ele.timestamp, ele.timestamp,
+                                              pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
+                    }
+                }
+            } else if (ele.type == FrameType::CALL || (ele.flags & PERF_DLFILTER_FLAG_CALL)) {
                 bool from_trace_begin = after_trace_begin;
                 after_trace_begin     = false;
 
@@ -1085,7 +1159,11 @@ namespace {
 
                 // If this is the first sample after TRACE_BEGIN and it is a CALL,
                 // push the caller frame onto the stack first if it is not already present.
-                if (from_trace_begin) {
+                bool push_caller_first = from_trace_begin;
+                if (!push_caller_first && (ele.flags & 0x60) == 0x60 && stack.empty()) {
+                    push_caller_first = true;
+                }
+                if (push_caller_first) {
                     std::string caller_sym_sanitized = SanitizeSymbol(caller_sym_str);
                     if (!caller_sym_sanitized.empty() && (caller_sym_sanitized != "[unknown]" || ele.ip != 0)) {
                         if (stack.empty() || stack.back().sym != caller_sym_sanitized) {
@@ -1288,8 +1366,26 @@ namespace {
                         }
                     }
                 } else {
-                    if (!stack.empty() &&
-                        ((stack.back().flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || stack.back().flags == FLAG_INTERRUPT)) {
+                    int irq_idx = -1;
+                    for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
+                        if ((stack[i].flags & 0x60) == 0x60 ||
+                            (stack[i].flags & FLAG_INTERRUPT) == FLAG_INTERRUPT) {
+                            irq_idx = i;
+                            break;
+                        }
+                    }
+                    if (irq_idx >= 0) {
+                        // Pop intermediate frames inside interrupt
+                        while (static_cast<int>(stack.size()) > irq_idx + 1) {
+                            auto child = stack.back();
+                            stack.pop_back();
+                            uint64_t end_time = ele.timestamp >= child.timestamp ? ele.timestamp : child.timestamp;
+                            recovered_ret_count++;
+
+                            out_events.push_back({TimelineEventType::END, end_time, child.timestamp,
+                                                  pidtid, child.sym, child.dso, child.caller, ele.cpu});
+                        }
+
                         auto popped = stack.back();
                         stack.pop_back();
 
@@ -1300,18 +1396,11 @@ namespace {
                         uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
                         uint64_t dur      = end_time - popped.timestamp;
 
-                        std::string irq_sym = "[interrupt]";
-
-                        // Mark the start event as interrupt
-                        if (popped.start_event_idx < out_events.size()) {
-                            out_events[popped.start_event_idx].sym = irq_sym;
-                        }
-
-                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
-                                  << irq_sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT (trace begin): "
+                                  << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
 
                         out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
-                                              pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
+                                              pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
                     }
                 }
             } else if (ele.type == FrameType::SYSCALL) {

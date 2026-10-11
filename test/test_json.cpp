@@ -349,6 +349,117 @@ int main()
         PtGraphReader::UnlinkAll(tb_prefix);
     }
 
+    // 5. Test Interrupt 0x63 entry and 0x45 exit with intermediate frame closure
+    // Sequence:
+    //   1) CALL _start (0x3) at ts 1000
+    //   2) Interrupt entry 0x63: IP _start, Addr asm_exc_page_fault at ts 2000
+    //   3) CALL error_entry (0x3) from asm_exc_page_fault at ts 2100
+    //   4) RETURN error_entry (0x5) at ts 2200
+    //   5) CALL exc_page_fault (0x3) from asm_exc_page_fault at ts 2300 (not explicitly returned)
+    //   6) Interrupt exit 0x45: IP native_irq_return_iret, Addr _start at ts 3000
+    //      -> must auto-close intermediate exc_page_fault, then close asm_exc_page_fault at ts 3000
+    //   7) RETURN _start (0x5) at ts 4000
+    {
+        const std::string irq_prefix = "ptgraph_test_irq_45_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(irq_prefix);
+        {
+            GraphDrawer drawer(nullptr, irq_prefix, 32, 1024, 4);
+
+            // Frame 0: CALL _start
+            FrameEle fe_start{};
+            fe_start.timestamp = 1000;
+            fe_start.pid       = 100;
+            fe_start.tid       = 57955;
+            fe_start.type      = FrameType::CALL;
+            fe_start.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_start.ip        = 0x7fff0000;
+            fe_start.addr      = 0x7fff0010;
+            drawer.AppendFrameWithSymbols(fe_start, "_start", "[entry]", "/bin/app");
+
+            // Frame 1: 0x63 interrupt entry to asm_exc_page_fault
+            FrameEle fe_irq_entry{};
+            fe_irq_entry.timestamp = 2000;
+            fe_irq_entry.pid       = 100;
+            fe_irq_entry.tid       = 57955;
+            fe_irq_entry.type      = FrameType::CALL;
+            fe_irq_entry.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL |
+                                     PERF_DLFILTER_FLAG_ASYNC | PERF_DLFILTER_FLAG_INTERRUPT; // 0x63
+            fe_irq_entry.ip        = 0x7fff0010;
+            fe_irq_entry.addr      = 0xffff0002;
+            drawer.AppendFrameWithSymbols(fe_irq_entry, "asm_exc_page_fault", "_start", "[kernel.kallsyms]");
+
+            // Frame 2: CALL error_entry
+            FrameEle fe_call1{};
+            fe_call1.timestamp = 2100;
+            fe_call1.pid       = 100;
+            fe_call1.tid       = 57955;
+            fe_call1.type      = FrameType::CALL;
+            fe_call1.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_call1.ip        = 0xffff0002;
+            fe_call1.addr      = 0xffff0010;
+            drawer.AppendFrameWithSymbols(fe_call1, "error_entry", "asm_exc_page_fault", "[kernel.kallsyms]");
+
+            // Frame 3: RETURN error_entry
+            FrameEle fe_ret1{};
+            fe_ret1.timestamp = 2200;
+            fe_ret1.pid       = 100;
+            fe_ret1.tid       = 57955;
+            fe_ret1.type      = FrameType::RETURN;
+            fe_ret1.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret1.ip        = 0xffff0010;
+            fe_ret1.addr      = 0xffff0002;
+            drawer.AppendFrameWithSymbols(fe_ret1, "error_entry", "asm_exc_page_fault", "[kernel.kallsyms]");
+
+            // Frame 4: CALL exc_page_fault (unreturned intermediate frame)
+            FrameEle fe_call2{};
+            fe_call2.timestamp = 2300;
+            fe_call2.pid       = 100;
+            fe_call2.tid       = 57955;
+            fe_call2.type      = FrameType::CALL;
+            fe_call2.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_call2.ip        = 0xffff0002;
+            fe_call2.addr      = 0xffff0020;
+            drawer.AppendFrameWithSymbols(fe_call2, "exc_page_fault", "asm_exc_page_fault", "[kernel.kallsyms]");
+
+            // Frame 5: 0x45 interrupt exit via native_irq_return_iret returning to _start
+            FrameEle fe_irq_exit{};
+            fe_irq_exit.timestamp = 3000;
+            fe_irq_exit.pid       = 100;
+            fe_irq_exit.tid       = 57955;
+            fe_irq_exit.type      = FrameType::RETURN;
+            fe_irq_exit.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_RETURN |
+                                    PERF_DLFILTER_FLAG_INTERRUPT; // 0x45
+            fe_irq_exit.ip        = 0xffff0050;
+            fe_irq_exit.addr      = 0x7fff0010;
+            drawer.AppendFrameWithSymbols(fe_irq_exit, "native_irq_return_iret", "_start", "[kernel.kallsyms]");
+
+            // Frame 6: RETURN _start
+            FrameEle fe_ret_start{};
+            fe_ret_start.timestamp = 4000;
+            fe_ret_start.pid       = 100;
+            fe_ret_start.tid       = 57955;
+            fe_ret_start.type      = FrameType::RETURN;
+            fe_ret_start.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret_start.ip        = 0x7fff0010;
+            fe_ret_start.addr      = 0x7fff0000;
+            drawer.AppendFrameWithSymbols(fe_ret_start, "_start", "[entry]", "/bin/app");
+
+            drawer.Finish();
+
+            std::string out_ftf = "/tmp/test_irq_45.ftf";
+            drawer.GenerateGraph(out_ftf);
+
+            // Verify the generated trace file exists
+            std::ifstream ftf(out_ftf, std::ios::binary);
+            assert(ftf.is_open());
+            ftf.close();
+            std::remove(out_ftf.c_str());
+            std::string gz_ftf = out_ftf + ".gz";
+            std::remove(gz_ftf.c_str());
+        }
+        PtGraphReader::UnlinkAll(irq_prefix);
+    }
+
     std::cout << "[TEST JSON] All JSON tests passed successfully!" << std::endl;
     return 0;
 }
