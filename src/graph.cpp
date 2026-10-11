@@ -280,10 +280,8 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     ele.cpu       = sample->cpu >= 0 ? static_cast<uint16_t>(sample->cpu) : 0;
     ele.flags     = sample->flags;
 
-    constexpr uint32_t FLAG_TRACE_BEGIN = PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH; // 0x101
-
     // Determine FrameType from sample flags
-    if ((sample->flags & (PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH)) == FLAG_TRACE_BEGIN) {
+    if (sample->flags & PERF_DLFILTER_FLAG_TRACE_BEGIN) {
         ele.type = FrameType::TRACE_BEGIN;
     } else if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
         ele.type = FrameType::CALL;
@@ -917,6 +915,10 @@ namespace {
     {
         std::vector<std::string> result;
         for (size_t i = current_idx + 1; i < frames.size() && result.size() < MAX_MATCH_LOOKAHEAD; ++i) {
+            if (frames[i].type == FrameType::TRACE_BEGIN ||
+                (frames[i].flags & PERF_DLFILTER_FLAG_TRACE_BEGIN)) {
+                break;
+            }
             if (frames[i].type == FrameType::RETURN) {
                 result.push_back(ReturnSymbol(frames[i], resolver, json_para));
             }
@@ -982,19 +984,20 @@ namespace {
         uint64_t last_seen_time = frames.back().timestamp;
         uint32_t tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
 
-        uint64_t calls_count          = 0;
-        uint64_t rets_count           = 0;
-        uint64_t exact_match_count    = 0;
-        uint64_t deep_match_count     = 0;
-        uint64_t missing_call_count   = 0;
-        uint64_t fallback_match_count = 0;
-        uint64_t recovered_ret_count  = 0;
-        uint64_t empty_rets_count     = 0;
-        uint64_t syscalls_count       = 0;
-        uint64_t interrupts_count     = 0;
-        uint64_t tail_pops_count      = 0;
-        size_t   max_depth            = 0;
-        uint64_t local_count          = 0;
+        uint64_t calls_count            = 0;
+        uint64_t rets_count             = 0;
+        uint64_t exact_match_count      = 0;
+        uint64_t deep_match_count       = 0;
+        uint64_t missing_call_count     = 0;
+        uint64_t fallback_match_count   = 0;
+        uint64_t recovered_ret_count    = 0;
+        uint64_t empty_rets_count       = 0;
+        uint64_t syscalls_count         = 0;
+        uint64_t interrupts_count       = 0;
+        uint64_t trace_begin_pops_count = 0;
+        uint64_t tail_pops_count        = 0;
+        size_t   max_depth              = 0;
+        uint64_t local_count            = 0;
 
         for (size_t frame_idx = 0; frame_idx < frames.size(); ++frame_idx) {
             const auto &ele            = frames[frame_idx];
@@ -1192,33 +1195,41 @@ namespace {
                     }
                 }
             } else if (ele.type == FrameType::TRACE_BEGIN ||
-                       ((ele.flags & (PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH)) ==
-                        (PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH))) {
+                       (ele.flags & PERF_DLFILTER_FLAG_TRACE_BEGIN)) {
                 constexpr uint32_t FLAG_INTERRUPT = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL |
                                                     PERF_DLFILTER_FLAG_ASYNC | PERF_DLFILTER_FLAG_INTERRUPT; // 0x63
-                if (!stack.empty() &&
-                    ((stack.back().flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || stack.back().flags == FLAG_INTERRUPT)) {
+                while (!stack.empty()) {
                     auto popped = stack.back();
                     stack.pop_back();
 
-                    interrupts_count++;
-                    if (calls_count > 0) {
-                        calls_count--;
+                    uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
+                    uint64_t dur      = end_time - popped.timestamp;
+
+                    if ((popped.flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || popped.flags == FLAG_INTERRUPT) {
+                        interrupts_count++;
+                        if (calls_count > 0) {
+                            calls_count--;
+                        }
+                        std::string irq_sym = "[interrupt]";
+
+                        // Mark the start event as interrupt
+                        if (popped.start_event_idx < out_events.size()) {
+                            out_events[popped.start_event_idx].sym = irq_sym;
+                        }
+
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
+                                  << irq_sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+
+                        out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                              pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
+                    } else {
+                        trace_begin_pops_count++;
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP TRACE_BEGIN: "
+                                  << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+
+                        out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                              pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
                     }
-                    uint64_t dur = ele.timestamp >= popped.timestamp ? (ele.timestamp - popped.timestamp) : 0;
-
-                    std::string irq_sym = "[interrupt]";
-
-                    // Mark the start event as interrupt
-                    if (popped.start_event_idx < out_events.size()) {
-                        out_events[popped.start_event_idx].sym = irq_sym;
-                    }
-
-                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
-                              << irq_sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
-
-                    out_events.push_back({TimelineEventType::END, ele.timestamp, popped.timestamp,
-                                          pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
                 }
             } else if (ele.type == FrameType::SYSCALL) {
                 syscalls_count++;
@@ -1264,6 +1275,7 @@ namespace {
                  << empty_rets_count << " pre-trace empty], "
                  << syscalls_count << " syscalls, "
                  << interrupts_count << " interrupts, "
+                 << trace_begin_pops_count << " trace begin pops, "
                  << tail_pops_count << " tail pops, max stack depth: "
                  << max_depth << ")" << std::endl;
         if (log_mutex) {
