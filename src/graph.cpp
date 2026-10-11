@@ -130,6 +130,9 @@ GraphDrawer::~GraphDrawer()
 void GraphDrawer::LoadConfig(const std::string &conf_file)
 {
     json_para_.Parse(conf_file.c_str());
+    if (close_stack_on_trace_begin_) {
+        json_para_.closeStackOnTraceBegin = true;
+    }
 
     // Only compute from json_para_.timeZone if ts_rank_begin_ns_/ts_rank_end_ns_ were not explicitly set via -b/-e
     if (ts_rank_begin_ns_ == 0 && ts_rank_end_ns_ == 0 && json_para_.timeZone) {
@@ -915,8 +918,9 @@ namespace {
     {
         std::vector<std::string> result;
         for (size_t i = current_idx + 1; i < frames.size() && result.size() < MAX_MATCH_LOOKAHEAD; ++i) {
-            if (frames[i].type == FrameType::TRACE_BEGIN ||
-                (frames[i].flags & PERF_DLFILTER_FLAG_TRACE_BEGIN)) {
+            if (json_para.closeStackOnTraceBegin &&
+                (frames[i].type == FrameType::TRACE_BEGIN ||
+                 (frames[i].flags & PERF_DLFILTER_FLAG_TRACE_BEGIN))) {
                 break;
             }
             if (frames[i].type == FrameType::RETURN) {
@@ -984,6 +988,8 @@ namespace {
         uint64_t last_seen_time = frames.back().timestamp;
         uint32_t tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
 
+        uint64_t last_trace_begin_time  = 0;
+        bool     has_trace_begin        = false;
         uint64_t calls_count            = 0;
         uint64_t rets_count             = 0;
         uint64_t exact_match_count      = 0;
@@ -1158,16 +1164,22 @@ namespace {
                 if (decision.keep_stack) {
                     if (stack.empty()) {
                         empty_rets_count++;
+                        uint64_t start_time = has_trace_begin ? last_trace_begin_time : ele.timestamp;
+                        if (start_time > ele.timestamp) {
+                            start_time = ele.timestamp;
+                        }
                         LOG_DEBUG << "[TID " << tid << "] RET isolated (empty stack, called pre-trace): "
-                                  << sym_str << " (ts=" << ele.timestamp << "), instantaneous closure" << std::endl;
+                                  << sym_str << " (start_ts=" << start_time << ", end_ts=" << ele.timestamp
+                                  << ", dur=" << (ele.timestamp - start_time) << " ns), virtual frame closure" << std::endl;
+                        out_events.push_back({TimelineEventType::FULL, ele.timestamp, start_time,
+                                              pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
                     } else {
                         missing_call_count++;
                         LOG_DEBUG << "[TID " << tid << "] RET isolated (missing CALL): "
                                   << sym_str << " (ts=" << ele.timestamp << "), instantaneous closure" << std::endl;
+                        out_events.push_back({TimelineEventType::FULL, ele.timestamp, ele.timestamp,
+                                              pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
                     }
-                    // Instantaneous closure for isolated RETURN
-                    out_events.push_back({TimelineEventType::FULL, ele.timestamp, ele.timestamp,
-                                          pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
                     continue;
                 }
 
@@ -1196,20 +1208,57 @@ namespace {
                 }
             } else if (ele.type == FrameType::TRACE_BEGIN ||
                        (ele.flags & PERF_DLFILTER_FLAG_TRACE_BEGIN)) {
+                last_trace_begin_time             = ele.timestamp;
+                has_trace_begin                   = true;
                 constexpr uint32_t FLAG_INTERRUPT = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL |
                                                     PERF_DLFILTER_FLAG_ASYNC | PERF_DLFILTER_FLAG_INTERRUPT; // 0x63
-                while (!stack.empty()) {
-                    auto popped = stack.back();
-                    stack.pop_back();
+                if (json_para.closeStackOnTraceBegin) {
+                    while (!stack.empty()) {
+                        auto popped = stack.back();
+                        stack.pop_back();
 
-                    uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
-                    uint64_t dur      = end_time - popped.timestamp;
+                        uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
+                        uint64_t dur      = end_time - popped.timestamp;
 
-                    if ((popped.flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || popped.flags == FLAG_INTERRUPT) {
+                        if ((popped.flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || popped.flags == FLAG_INTERRUPT) {
+                            interrupts_count++;
+                            if (calls_count > 0) {
+                                calls_count--;
+                            }
+                            std::string irq_sym = "[interrupt]";
+
+                            // Mark the start event as interrupt
+                            if (popped.start_event_idx < out_events.size()) {
+                                out_events[popped.start_event_idx].sym = irq_sym;
+                            }
+
+                            LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
+                                      << irq_sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+
+                            out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                                  pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
+                        } else {
+                            trace_begin_pops_count++;
+                            LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP TRACE_BEGIN: "
+                                      << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+
+                            out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                                  pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
+                        }
+                    }
+                } else {
+                    if (!stack.empty() &&
+                        ((stack.back().flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || stack.back().flags == FLAG_INTERRUPT)) {
+                        auto popped = stack.back();
+                        stack.pop_back();
+
                         interrupts_count++;
                         if (calls_count > 0) {
                             calls_count--;
                         }
+                        uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
+                        uint64_t dur      = end_time - popped.timestamp;
+
                         std::string irq_sym = "[interrupt]";
 
                         // Mark the start event as interrupt
@@ -1222,13 +1271,6 @@ namespace {
 
                         out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
                                               pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
-                    } else {
-                        trace_begin_pops_count++;
-                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP TRACE_BEGIN: "
-                                  << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
-
-                        out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
-                                              pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
                     }
                 }
             } else if (ele.type == FrameType::SYSCALL) {

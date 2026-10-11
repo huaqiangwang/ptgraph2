@@ -171,11 +171,89 @@ int main()
 
         assert(drawer.GetJsonPara().HasFuncZone());
         assert(drawer.GetJsonPara().HasTimeZone());
+        assert(!drawer.GetCloseStackOnTraceBegin());
     }
     PtGraphReader::UnlinkAll(prefix);
 
     // Clean up temporary file
     std::remove(test_conf_path);
+
+    // 2. Test closeStackOnTraceBegin configuration options
+    {
+        // Default is false
+        JsonPara default_para;
+        assert(!default_para.closeStackOnTraceBegin);
+
+        const char *conf_true = "/tmp/test_trace_begin_true.json";
+        {
+            std::ofstream out(conf_true);
+            out << R"({ "closeStackOnTraceBegin": true })";
+        }
+        JsonPara para_true;
+        para_true.Parse(conf_true);
+        assert(para_true.closeStackOnTraceBegin == true);
+        std::remove(conf_true);
+
+        const char *conf_false = "/tmp/test_trace_begin_false.json";
+        {
+            std::ofstream out(conf_false);
+            out << R"({ "closeStackOnTraceBegin": false })";
+        }
+        JsonPara para_false;
+        para_false.Parse(conf_false);
+        assert(para_false.closeStackOnTraceBegin == false);
+        std::remove(conf_false);
+
+        // Alias: closeFrameOnTraceBegin
+        const char *conf_alias1 = "/tmp/test_trace_begin_alias1.json";
+        {
+            std::ofstream out(conf_alias1);
+            out << R"({ "closeFrameOnTraceBegin": true })";
+        }
+        JsonPara para_alias1;
+        para_alias1.Parse(conf_alias1);
+        assert(para_alias1.closeStackOnTraceBegin == true);
+        std::remove(conf_alias1);
+
+        // Alias: closeFramesOnTraceBegin
+        const char *conf_alias2 = "/tmp/test_trace_begin_alias2.json";
+        {
+            std::ofstream out(conf_alias2);
+            out << R"({ "closeFramesOnTraceBegin": true })";
+        }
+        JsonPara para_alias2;
+        para_alias2.Parse(conf_alias2);
+        assert(para_alias2.closeStackOnTraceBegin == true);
+        std::remove(conf_alias2);
+
+        // Nested: traceBegin.closeStack
+        const char *conf_nested = "/tmp/test_trace_begin_nested.json";
+        {
+            std::ofstream out(conf_nested);
+            out << R"({ "traceBegin": { "closeStack": true } })";
+        }
+        JsonPara para_nested;
+        para_nested.Parse(conf_nested);
+        assert(para_nested.closeStackOnTraceBegin == true);
+        std::remove(conf_nested);
+    }
+
+    // 3. Test GraphDrawer with closeStackOnTraceBegin
+    {
+        const std::string tb_prefix = "ptgraph_test_tb_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(tb_prefix);
+        {
+            GraphDrawer drawer(nullptr, tb_prefix);
+            assert(!drawer.GetCloseStackOnTraceBegin());
+
+            drawer.SetCloseStackOnTraceBegin(true);
+            assert(drawer.GetCloseStackOnTraceBegin());
+
+            drawer.SetCloseStackOnTraceBegin(false);
+            assert(!drawer.GetCloseStackOnTraceBegin());
+        }
+        PtGraphReader::UnlinkAll(tb_prefix);
+    }
 
     std::cout << "[TEST JSON] All JSON tests passed successfully!" << std::endl;
     return 0;

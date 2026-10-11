@@ -282,6 +282,7 @@ struct JsonPara
     std::shared_ptr<std::vector<std::shared_ptr<EndFrame>>>   frameEndSkipping;
 
     bool perTidOutput{false};
+    bool closeStackOnTraceBegin{false};
 
     LogLevel debugLevel = LogLevel::INFO;
 
@@ -498,6 +499,55 @@ struct JsonPara
                 perTidOutput = json_conf["perTidOutput"].get<bool>();
             }
 
+            // Close stack on TRACE_BEGIN option (default: false)
+            auto parseBool = [](const json &j, const std::string &key, bool &out) -> bool {
+                if (!j.contains(key))
+                    return false;
+                const auto &val = j[key];
+                if (val.is_boolean()) {
+                    out = val.get<bool>();
+                    return true;
+                } else if (val.is_number()) {
+                    out = (val.get<int>() != 0);
+                    return true;
+                } else if (val.is_string()) {
+                    std::string s = val.get<std::string>();
+                    out           = (s == "true" || s == "1" || s == "yes" || s == "on");
+                    return true;
+                }
+                return false;
+            };
+
+            if (!parseBool(json_conf, "closeStackOnTraceBegin", closeStackOnTraceBegin)) {
+                if (!parseBool(json_conf, "closeFrameOnTraceBegin", closeStackOnTraceBegin)) {
+                    if (!parseBool(json_conf, "closeFramesOnTraceBegin", closeStackOnTraceBegin)) {
+                        if (!parseBool(json_conf, "close_stack_on_trace_begin", closeStackOnTraceBegin)) {
+                            if (!parseBool(json_conf, "close_frame_on_trace_begin", closeStackOnTraceBegin)) {
+                                if (!parseBool(json_conf, "close_frames_on_trace_begin", closeStackOnTraceBegin)) {
+                                    if (!parseBool(json_conf, "splitOnTraceBegin", closeStackOnTraceBegin)) {
+                                        parseBool(json_conf, "split_on_trace_begin", closeStackOnTraceBegin);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (json_conf.contains("traceBegin") && json_conf["traceBegin"].is_object()) {
+                const auto &tb = json_conf["traceBegin"];
+                parseBool(tb, "closeStack", closeStackOnTraceBegin) ||
+                    parseBool(tb, "closeFrames", closeStackOnTraceBegin) ||
+                    parseBool(tb, "closeFrame", closeStackOnTraceBegin) ||
+                    parseBool(tb, "enabled", closeStackOnTraceBegin);
+            } else if (json_conf.contains("trace_begin") && json_conf["trace_begin"].is_object()) {
+                const auto &tb = json_conf["trace_begin"];
+                parseBool(tb, "close_stack", closeStackOnTraceBegin) ||
+                    parseBool(tb, "close_frames", closeStackOnTraceBegin) ||
+                    parseBool(tb, "close_frame", closeStackOnTraceBegin) ||
+                    parseBool(tb, "enabled", closeStackOnTraceBegin);
+            }
+
         } catch (const nlohmann::json::parse_error &e) {
             std::cerr << "JSON parse error: " << e.what() << std::endl;
             clear();
@@ -523,6 +573,7 @@ struct JsonPara
         frameEndSkipping       = nullptr;
         endFramePair           = nullptr;
         perTidOutput           = false;
+        closeStackOnTraceBegin = false;
         debugLevel             = LogLevel::INFO;
         Logger::SetLevel(LogLevel::INFO);
     }

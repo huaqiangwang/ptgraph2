@@ -141,6 +141,13 @@ public:
     void SetPerTidOutput(bool val) { per_tid_output_ = val; }
     bool GetPerTidOutput() const { return per_tid_output_ || json_para_.perTidOutput; }
 
+    void SetCloseStackOnTraceBegin(bool val)
+    {
+        close_stack_on_trace_begin_       = val;
+        json_para_.closeStackOnTraceBegin = val;
+    }
+    bool GetCloseStackOnTraceBegin() const { return close_stack_on_trace_begin_ || json_para_.closeStackOnTraceBegin; }
+
     void               SetOutFilename(const std::string &fname) { outfilename_ = fname; }
     const std::string &GetOutFilename() const { return outfilename_; }
 
@@ -230,6 +237,7 @@ private:
     bool        unlink_on_destroy_{false};
     bool        is_finished_{false};
     bool        per_tid_output_{false};
+    bool        close_stack_on_trace_begin_{false};
     std::string outfilename_{"out.ftf"};
     uint64_t    ts_global_begin_ns_{0};
     uint64_t    ts_global_end_ns_{0};
