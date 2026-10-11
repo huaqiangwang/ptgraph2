@@ -460,6 +460,304 @@ int main()
         PtGraphReader::UnlinkAll(irq_prefix);
     }
 
+    // 6. Test Syscall 0x13 entry and 0x15 exit:
+    //    - Symbol "entry_SYSCALL_64_after_hwframe" converted to "entry_SYSCALL_64"
+    //    - Full closure across intermediate child kernel calls (e.g. unreturned do_syscall_64, sys_read)
+    //    - entry_SYSCALL_64 bounded by start ts (from 0x13) and end ts (from 0x15)
+    {
+        const std::string sc_prefix = "ptgraph_test_syscall_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(sc_prefix);
+        {
+            GraphDrawer drawer(nullptr, sc_prefix, 32, 1024, 4);
+
+            // Frame 0: User space CALL main
+            FrameEle fe_main{};
+            fe_main.timestamp = 1000;
+            fe_main.pid       = 100;
+            fe_main.tid       = 57955;
+            fe_main.type      = FrameType::CALL;
+            fe_main.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_main.ip        = 0x400000;
+            fe_main.addr      = 0x400100;
+            drawer.AppendFrameWithSymbols(fe_main, "main", "_start", "/bin/app");
+
+            // Frame 1: 0x13 syscall entry to entry_SYSCALL_64_after_hwframe
+            FrameEle fe_sc_entry{};
+            fe_sc_entry.timestamp = 2000;
+            fe_sc_entry.pid       = 100;
+            fe_sc_entry.tid       = 57955;
+            fe_sc_entry.type      = FrameType::CALL;
+            fe_sc_entry.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL | PERF_DLFILTER_FLAG_SYSCALLRET; // 0x13
+            fe_sc_entry.ip        = 0x400150;
+            fe_sc_entry.addr      = 0xffffffff96800080ULL;
+            drawer.AppendFrameWithSymbols(fe_sc_entry, "entry_SYSCALL_64_after_hwframe", "main", "[kernel.kallsyms]");
+
+            // Frame 2: CALL do_syscall_64 inside syscall
+            FrameEle fe_call1{};
+            fe_call1.timestamp = 2200;
+            fe_call1.pid       = 100;
+            fe_call1.tid       = 57955;
+            fe_call1.type      = FrameType::CALL;
+            fe_call1.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_call1.ip        = 0xffffffff96800080ULL;
+            fe_call1.addr      = 0xffffffff96800200ULL;
+            drawer.AppendFrameWithSymbols(fe_call1, "do_syscall_64", "entry_SYSCALL_64", "[kernel.kallsyms]");
+
+            // Frame 3: CALL sys_read inside do_syscall_64 (unreturned child)
+            FrameEle fe_call2{};
+            fe_call2.timestamp = 2400;
+            fe_call2.pid       = 100;
+            fe_call2.tid       = 57955;
+            fe_call2.type      = FrameType::CALL;
+            fe_call2.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_call2.ip        = 0xffffffff96800200ULL;
+            fe_call2.addr      = 0xffffffff96800300ULL;
+            drawer.AppendFrameWithSymbols(fe_call2, "sys_read", "do_syscall_64", "[kernel.kallsyms]");
+
+            // Frame 4: 0x15 syscall exit returning to main
+            FrameEle fe_sc_exit{};
+            fe_sc_exit.timestamp = 3000;
+            fe_sc_exit.pid       = 100;
+            fe_sc_exit.tid       = 57955;
+            fe_sc_exit.type      = FrameType::SYSCALL;
+            fe_sc_exit.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_SYSCALLRET; // 0x15
+            fe_sc_exit.ip        = 0xffffffff96800080ULL;
+            fe_sc_exit.addr      = 0x400155;
+            drawer.AppendFrameWithSymbols(fe_sc_exit, "entry_SYSCALL_64_after_hwframe", "main", "[kernel.kallsyms]");
+
+            // Frame 5: RETURN main
+            FrameEle fe_ret_main{};
+            fe_ret_main.timestamp = 4000;
+            fe_ret_main.pid       = 100;
+            fe_ret_main.tid       = 57955;
+            fe_ret_main.type      = FrameType::RETURN;
+            fe_ret_main.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret_main.ip        = 0x400100;
+            fe_ret_main.addr      = 0x400000;
+            drawer.AppendFrameWithSymbols(fe_ret_main, "main", "_start", "/bin/app");
+
+            drawer.Finish();
+
+            std::string out_ftf = "/tmp/test_syscall.ftf";
+            drawer.GenerateGraph(out_ftf);
+
+            // Verify the generated trace file exists
+            std::ifstream ftf(out_ftf, std::ios::binary);
+            assert(ftf.is_open());
+            ftf.close();
+            std::remove(out_ftf.c_str());
+            std::string gz_ftf = out_ftf + ".gz";
+            std::remove(gz_ftf.c_str());
+        }
+        PtGraphReader::UnlinkAll(sc_prefix);
+    }
+
+    // 7. Test Syscall 0x15 exit without preceding 0x13:
+    //    - TRACE_BEGIN 0x101 in kernel space at ts 1000
+    //    - CALL sys_read in kernel space at ts 1500
+    //    - Syscall exit 0x15 at ts 2500
+    //    - Must backtrack to flags 0x101 and close all kernel space functions
+    {
+        const std::string sc_bt_prefix = "ptgraph_test_syscall_bt_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(sc_bt_prefix);
+        {
+            GraphDrawer drawer(nullptr, sc_bt_prefix, 32, 1024, 4);
+
+            // Frame 0: TRACE_BEGIN 0x101 in kernel space
+            FrameEle fe_tb{};
+            fe_tb.timestamp = 1000;
+            fe_tb.pid       = 100;
+            fe_tb.tid       = 57955;
+            fe_tb.type      = FrameType::TRACE_BEGIN;
+            fe_tb.flags     = PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH; // 0x101
+            fe_tb.ip        = 0xffffffff96800000ULL;
+            fe_tb.addr      = 0xffffffff96800080ULL;
+            drawer.AppendFrameWithSymbols(fe_tb, "entry_SYSCALL_64", "main", "[kernel.kallsyms]");
+
+            // Frame 1: CALL sys_read in kernel space
+            FrameEle fe_call{};
+            fe_call.timestamp = 1500;
+            fe_call.pid       = 100;
+            fe_call.tid       = 57955;
+            fe_call.type      = FrameType::CALL;
+            fe_call.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_call.ip        = 0xffffffff96800080ULL;
+            fe_call.addr      = 0xffffffff96800300ULL;
+            drawer.AppendFrameWithSymbols(fe_call, "sys_read", "entry_SYSCALL_64", "[kernel.kallsyms]");
+
+            // Frame 2: 0x15 syscall exit returning to main (no 0x13 preceding)
+            FrameEle fe_sc_exit{};
+            fe_sc_exit.timestamp = 2500;
+            fe_sc_exit.pid       = 100;
+            fe_sc_exit.tid       = 57955;
+            fe_sc_exit.type      = FrameType::SYSCALL;
+            fe_sc_exit.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_SYSCALLRET; // 0x15
+            fe_sc_exit.ip        = 0xffffffff96800080ULL;
+            fe_sc_exit.addr      = 0x400155;
+            drawer.AppendFrameWithSymbols(fe_sc_exit, "entry_SYSCALL_64_after_hwframe", "main", "[kernel.kallsyms]");
+
+            drawer.Finish();
+
+            std::string out_ftf = "/tmp/test_syscall_bt.ftf";
+            drawer.GenerateGraph(out_ftf);
+
+            // Verify the generated trace file exists
+            std::ifstream ftf(out_ftf, std::ios::binary);
+            assert(ftf.is_open());
+            ftf.close();
+            std::remove(out_ftf.c_str());
+            std::string gz_ftf = out_ftf + ".gz";
+            std::remove(gz_ftf.c_str());
+        }
+        PtGraphReader::UnlinkAll(sc_bt_prefix);
+    }
+
+    // 8. Test Syscall 0x15 exit without preceding 0x13 and entry_SYSCALL_64 not on stack:
+    //    - TRACE_BEGIN 0x101 in kernel space at ts 1000
+    //    - CALL sys_read in kernel space at ts 1500 (caller is do_syscall_64, not entry_SYSCALL_64)
+    //    - Syscall exit 0x15 at ts 2500
+    //    - Must pop and close kernel functions on stack, and create full closure for entry_SYSCALL_64 from 1000 to 2500
+    {
+        const std::string sc_bt2_prefix = "ptgraph_test_syscall_bt2_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(sc_bt2_prefix);
+        {
+            GraphDrawer drawer(nullptr, sc_bt2_prefix, 32, 1024, 4);
+
+            // Frame 0: TRACE_BEGIN 0x101 in kernel space
+            FrameEle fe_tb{};
+            fe_tb.timestamp = 1000;
+            fe_tb.pid       = 100;
+            fe_tb.tid       = 57955;
+            fe_tb.type      = FrameType::TRACE_BEGIN;
+            fe_tb.flags     = PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH; // 0x101
+            fe_tb.ip        = 0xffffffff96800000ULL;
+            fe_tb.addr      = 0xffffffff96800080ULL;
+            drawer.AppendFrameWithSymbols(fe_tb, "ffffffff96800080", "main", "[kernel.kallsyms]");
+
+            // Frame 1: CALL sys_read in kernel space (caller do_syscall_64)
+            FrameEle fe_call{};
+            fe_call.timestamp = 1500;
+            fe_call.pid       = 100;
+            fe_call.tid       = 57955;
+            fe_call.type      = FrameType::CALL;
+            fe_call.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_call.ip        = 0xffffffff96800200ULL;
+            fe_call.addr      = 0xffffffff96800300ULL;
+            drawer.AppendFrameWithSymbols(fe_call, "sys_read", "do_syscall_64", "[kernel.kallsyms]");
+
+            // Frame 2: 0x15 syscall exit returning to main
+            FrameEle fe_sc_exit{};
+            fe_sc_exit.timestamp = 2500;
+            fe_sc_exit.pid       = 100;
+            fe_sc_exit.tid       = 57955;
+            fe_sc_exit.type      = FrameType::SYSCALL;
+            fe_sc_exit.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_SYSCALLRET; // 0x15
+            fe_sc_exit.ip        = 0xffffffff96800080ULL;
+            fe_sc_exit.addr      = 0x400155;
+            drawer.AppendFrameWithSymbols(fe_sc_exit, "entry_SYSCALL_64_after_hwframe", "main", "[kernel.kallsyms]");
+
+            drawer.Finish();
+
+            std::string out_ftf = "/tmp/test_syscall_bt2.ftf";
+            drawer.GenerateGraph(out_ftf);
+
+            // Verify the generated trace file exists
+            std::ifstream ftf(out_ftf, std::ios::binary);
+            assert(ftf.is_open());
+            ftf.close();
+            std::remove(out_ftf.c_str());
+            std::string gz_ftf = out_ftf + ".gz";
+            std::remove(gz_ftf.c_str());
+        }
+        PtGraphReader::UnlinkAll(sc_bt2_prefix);
+    }
+
+    // 8. Test 0x101 TRACE_BEGIN popping stack down to target sym (inclusive)
+    // Sequence:
+    //   - Frame 0: CALL _start at ts 1000
+    //   - Frame 1: CALL _dl_start at ts 2000
+    //   - Frame 2: CALL child_func at ts 2500
+    //   - Frame 3: 0x101 TRACE_BEGIN with IP=0, caller="", callee="_dl_start" at ts 3000
+    //              Must pop child_func AND _dl_start, closing both at ts 3000
+    //   - Frame 4: RETURN _start at ts 4000
+    //              Matches _start on stack, closing it at ts 4000
+    {
+        const std::string tb_sym_pop_prefix = "ptgraph_test_tb_sym_pop_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(tb_sym_pop_prefix);
+        {
+            GraphDrawer drawer(nullptr, tb_sym_pop_prefix, 32, 1024, 4);
+
+            // Frame 0: CALL _start
+            FrameEle fe_start{};
+            fe_start.timestamp = 1000;
+            fe_start.pid       = 100;
+            fe_start.tid       = 57955;
+            fe_start.type      = FrameType::CALL;
+            fe_start.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_start.ip        = 0x400000;
+            fe_start.addr      = 0x400100;
+            drawer.AppendFrameWithSymbols(fe_start, "_start", "[entry]", "/bin/app");
+
+            // Frame 1: CALL _dl_start
+            FrameEle fe_dl{};
+            fe_dl.timestamp = 2000;
+            fe_dl.pid       = 100;
+            fe_dl.tid       = 57955;
+            fe_dl.type      = FrameType::CALL;
+            fe_dl.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_dl.ip        = 0x400100;
+            fe_dl.addr      = 0x7fff0000;
+            drawer.AppendFrameWithSymbols(fe_dl, "_dl_start", "_start", "/usr/lib/x86_64-linux-gnu/ld.so");
+
+            // Frame 2: CALL child_func
+            FrameEle fe_child{};
+            fe_child.timestamp = 2500;
+            fe_child.pid       = 100;
+            fe_child.tid       = 57955;
+            fe_child.type      = FrameType::CALL;
+            fe_child.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL;
+            fe_child.ip        = 0x7fff0000;
+            fe_child.addr      = 0x7fff0500;
+            drawer.AppendFrameWithSymbols(fe_child, "child_func", "_dl_start", "/usr/lib/x86_64-linux-gnu/ld.so");
+
+            // Frame 3: 0x101 TRACE_BEGIN with IP=0, caller="", callee="_dl_start"
+            FrameEle fe_tb{};
+            fe_tb.timestamp = 3000;
+            fe_tb.pid       = 100;
+            fe_tb.tid       = 57955;
+            fe_tb.type      = FrameType::TRACE_BEGIN;
+            fe_tb.flags     = PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH; // 0x101
+            fe_tb.ip        = 0;
+            fe_tb.addr      = 0x7fff0000;
+            drawer.AppendFrameWithSymbols(fe_tb, "_dl_start", "", "/usr/lib/x86_64-linux-gnu/ld.so");
+
+            // Frame 4: RETURN _start
+            FrameEle fe_ret{};
+            fe_ret.timestamp = 4000;
+            fe_ret.pid       = 100;
+            fe_ret.tid       = 57955;
+            fe_ret.type      = FrameType::RETURN;
+            fe_ret.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret.ip        = 0x400100;
+            fe_ret.addr      = 0x400000;
+            drawer.AppendFrameWithSymbols(fe_ret, "_start", "[entry]", "/bin/app");
+
+            drawer.Finish();
+
+            std::string out_ftf = "/tmp/test_tb_sym_pop.ftf";
+            drawer.GenerateGraph(out_ftf);
+
+            // Verify the generated trace file exists
+            std::ifstream ftf(out_ftf, std::ios::binary);
+            assert(ftf.is_open());
+            ftf.close();
+            std::remove(out_ftf.c_str());
+            std::string gz_ftf = out_ftf + ".gz";
+            std::remove(gz_ftf.c_str());
+        }
+        PtGraphReader::UnlinkAll(tb_sym_pop_prefix);
+    }
+
     std::cout << "[TEST JSON] All JSON tests passed successfully!" << std::endl;
     return 0;
 }

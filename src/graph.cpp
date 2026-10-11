@@ -288,6 +288,10 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         ele.type = FrameType::TRACE_BEGIN;
     } else if ((sample->flags & 0x60) == 0x40) {
         ele.type = FrameType::INTERRUPT;
+    } else if ((sample->flags & 0x17) == 0x15 || sample->flags == 0x15) {
+        ele.type = FrameType::SYSCALL;
+    } else if ((sample->flags & 0x17) == 0x13 || sample->flags == 0x13) {
+        ele.type = FrameType::CALL;
     } else if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
         ele.type = FrameType::CALL;
     } else if (sample->flags & PERF_DLFILTER_FLAG_RETURN) {
@@ -353,14 +357,14 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
 
     // Distinguish CALL vs RETURN callee/caller roles:
     // - CALL: destination addr is callee being entered; ip is call site in caller
-    // - RETURN / INTERRUPT exit: ip is returning callee; addr is return site in caller
+    // - RETURN / INTERRUPT exit / SYSCALL exit: ip is returning callee; addr is return site in caller
     if (ele.type == FrameType::CALL) {
         ele.addr       = sample->addr;
         ele.ip         = sample->ip;
         sym_str        = addr_sym;
         caller_sym_str = ip_sym;
         dso_str        = addr_dso.empty() ? ip_dso : addr_dso;
-    } else if (ele.type == FrameType::RETURN || ele.type == FrameType::INTERRUPT) {
+    } else if (ele.type == FrameType::RETURN || ele.type == FrameType::INTERRUPT || ele.type == FrameType::SYSCALL) {
         ele.ip         = sample->ip;
         ele.addr       = sample->addr;
         sym_str        = ip_sym;
@@ -379,6 +383,33 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         caller_sym_str = addr_sym;
         dso_str        = ip_dso;
     }
+
+    if (sym_str == "entry_SYSCALL_64_after_hwframe" || sym_str.find("entry_SYSCALL_64_after_hwframe") == 0) {
+        sym_str = "entry_SYSCALL_64";
+    }
+    if (caller_sym_str == "entry_SYSCALL_64_after_hwframe" || caller_sym_str.find("entry_SYSCALL_64_after_hwframe") == 0) {
+        caller_sym_str = "entry_SYSCALL_64";
+    }
+
+    if ((sample->flags & 0x17) == 0x13 || sample->flags == 0x13) {
+        if (sym_str.empty() || sym_str == "[unknown]" ||
+            (sym_str.size() == 16 && sym_str.rfind("ffffffff", 0) == 0)) {
+            sym_str = "entry_SYSCALL_64";
+        }
+        if (dso_str.empty()) {
+            dso_str = "[kernel.kallsyms]";
+        }
+    }
+    if ((sample->flags & 0x17) == 0x15 || sample->flags == 0x15) {
+        if (sym_str.empty() || sym_str == "[unknown]" ||
+            (sym_str.size() == 16 && sym_str.rfind("ffffffff", 0) == 0)) {
+            sym_str = "entry_SYSCALL_64";
+        }
+        if (dso_str.empty()) {
+            dso_str = "[kernel.kallsyms]";
+        }
+    }
+
     LOG_TRACE << ", IP " << ip_sym << ", Addr " << addr_sym << ", DSO " << dso_str << ", flags 0x"
               << std::hex << sample->flags << std::dec << std::endl;
 
@@ -413,7 +444,8 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
             }
         }
     }
-    if (json_para_.frameEndSkipping && (sample->flags & PERF_DLFILTER_FLAG_RETURN) && ((sample->flags & 0x60) != 0x40)) {
+    if (json_para_.frameEndSkipping && (sample->flags & PERF_DLFILTER_FLAG_RETURN) &&
+        ((sample->flags & 0x60) != 0x40) && ((sample->flags & 0x17) != 0x15) && (sample->flags != 0x15)) {
         for (const auto &skip_rule : *json_para_.frameEndSkipping) {
             if (skip_rule && skip_rule->Match(sym_str, dso_str, sample->ip, sample->addr)) {
                 return;
@@ -883,7 +915,24 @@ namespace {
         if (pos != std::string::npos) {
             s.resize(pos);
         }
+        if (s == "entry_SYSCALL_64_after_hwframe" || s.find("entry_SYSCALL_64_after_hwframe") == 0) {
+            s = "entry_SYSCALL_64";
+        }
         return s;
+    }
+
+    inline bool IsKernelFrame(const StackFrame &f)
+    {
+        if (f.sym == "entry_SYSCALL_64" || f.sym == "entry_SYSCALL_64_after_hwframe") {
+            return true;
+        }
+        if (f.dso.find("[kernel") != std::string::npos || f.dso.find("vmlinux") != std::string::npos) {
+            return true;
+        }
+        if (f.ip >= 0xffff800000000000ULL || (f.addr >= 0xffff800000000000ULL && f.ip == 0)) {
+            return true;
+        }
+        return false;
     }
 
     constexpr size_t MAX_MATCH_LOOKAHEAD = 16;
@@ -925,7 +974,9 @@ namespace {
                  (frames[i].flags & PERF_DLFILTER_FLAG_TRACE_BEGIN))) {
                 break;
             }
-            if ((frames[i].flags & 0x60) == 0x40 || frames[i].type == FrameType::INTERRUPT) {
+            if ((frames[i].flags & 0x60) == 0x40 || frames[i].type == FrameType::INTERRUPT ||
+                (frames[i].flags & 0x17) == 0x15 || frames[i].flags == 0x15 ||
+                frames[i].type == FrameType::SYSCALL) {
                 continue;
             }
             if (frames[i].type == FrameType::RETURN) {
@@ -1053,6 +1104,28 @@ namespace {
             if (caller_sym_str.empty())
                 caller_sym_str = "[unknown]";
 
+            sym_str        = SanitizeSymbol(sym_str);
+            caller_sym_str = SanitizeSymbol(caller_sym_str);
+
+            if ((ele.flags & 0x17) == 0x13 || ele.flags == 0x13) {
+                if (sym_str.empty() || sym_str == "[unknown]" ||
+                    (sym_str.size() == 16 && sym_str.rfind("ffffffff", 0) == 0)) {
+                    sym_str = "entry_SYSCALL_64";
+                }
+                if (dso_str.empty()) {
+                    dso_str = "[kernel.kallsyms]";
+                }
+            }
+            if ((ele.flags & 0x17) == 0x15 || ele.flags == 0x15) {
+                if (sym_str.empty() || sym_str == "[unknown]" ||
+                    (sym_str.size() == 16 && sym_str.rfind("ffffffff", 0) == 0)) {
+                    sym_str = "entry_SYSCALL_64";
+                }
+                if (dso_str.empty()) {
+                    dso_str = "[kernel.kallsyms]";
+                }
+            }
+
             // Check for Interrupt exit (flags with bit 0x40 and not 0x20, e.g. 0x45)
             if ((ele.flags & 0x60) == 0x40 || ele.type == FrameType::INTERRUPT) {
                 after_trace_begin = false;
@@ -1122,12 +1195,142 @@ namespace {
                                               pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
                     }
                 }
+            } else if ((ele.flags & 0x17) == 0x15 || ele.flags == 0x15 ||
+                       ((ele.flags & (PERF_DLFILTER_FLAG_SYSCALLRET | PERF_DLFILTER_FLAG_RETURN)) ==
+                        (PERF_DLFILTER_FLAG_SYSCALLRET | PERF_DLFILTER_FLAG_RETURN)) ||
+                       (ele.type == FrameType::SYSCALL && !(ele.flags & PERF_DLFILTER_FLAG_CALL))) {
+                after_trace_begin = false;
+                sym_str           = SanitizeSymbol(sym_str);
+                if (sym_str.empty() || sym_str == "[unknown]" ||
+                    (sym_str.size() == 16 && sym_str.rfind("ffffffff", 0) == 0)) {
+                    sym_str = "entry_SYSCALL_64";
+                }
+
+                // Find matching syscall entry frame on stack (0x13 or entry_SYSCALL_64)
+                int sc_idx = -1;
+                for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
+                    if ((stack[i].flags & 0x17) == 0x13 || stack[i].flags == 0x13 ||
+                        stack[i].sym == "entry_SYSCALL_64") {
+                        sc_idx = i;
+                        break;
+                    }
+                }
+
+                if (sc_idx >= 0) {
+                    // Close all intermediate child frames pushed inside this syscall
+                    while (static_cast<int>(stack.size()) > sc_idx + 1) {
+                        auto child = stack.back();
+                        stack.pop_back();
+
+                        uint64_t end_time = ele.timestamp >= child.timestamp ? ele.timestamp : child.timestamp;
+                        uint64_t dur      = end_time - child.timestamp;
+                        recovered_ret_count++;
+
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP SYSCALL CHILD: "
+                                  << child.sym << " (dur=" << dur << " ns, started at " << child.timestamp << ")" << std::endl;
+
+                        out_events.push_back({TimelineEventType::END, end_time, child.timestamp,
+                                              pidtid, child.sym, child.dso, child.caller, ele.cpu});
+                    }
+
+                    // Close the syscall entry frame itself
+                    auto sc_frame = stack.back();
+                    stack.pop_back();
+
+                    syscalls_count++;
+                    if (calls_count > 0) {
+                        calls_count--;
+                    }
+
+                    uint64_t    end_time = ele.timestamp >= sc_frame.timestamp ? ele.timestamp : sc_frame.timestamp;
+                    uint64_t    dur      = end_time - sc_frame.timestamp;
+                    std::string sc_sym   = "entry_SYSCALL_64";
+
+                    // Ensure start event symbol is clean
+                    if (sc_frame.start_event_idx < out_events.size()) {
+                        out_events[sc_frame.start_event_idx].sym = sc_sym;
+                    }
+
+                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP SYSCALL: "
+                              << sc_sym << " (dur=" << dur << " ns, started at " << sc_frame.timestamp
+                              << ", ended at " << end_time << ")" << std::endl;
+
+                    out_events.push_back({TimelineEventType::END, end_time, sc_frame.timestamp,
+                                          pidtid, sc_sym, sc_frame.dso, sc_frame.caller, ele.cpu});
+                } else {
+                    // No matching 0x13 entry found on stack.
+                    // Backtrack from back to front, finding all kernel space functions
+                    // all the way to flags=0x101, and close all of them.
+                    bool had_entry_syscall_on_stack = false;
+                    while (!stack.empty() && IsKernelFrame(stack.back())) {
+                        auto popped = stack.back();
+                        stack.pop_back();
+                        if (popped.sym == "entry_SYSCALL_64") {
+                            had_entry_syscall_on_stack = true;
+                        }
+
+                        uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
+                        uint64_t dur      = end_time - popped.timestamp;
+                        recovered_ret_count++;
+
+                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP KERNEL (syscall ret backtrack): "
+                                  << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+
+                        out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                              pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
+                    }
+
+                    // Backtrack in frames history to find the preceding flags=0x101
+                    int tb_idx = -1;
+                    for (int k = static_cast<int>(frame_idx) - 1; k >= 0; --k) {
+                        if (frames[k].flags == 0x101 || (frames[k].flags & PERF_DLFILTER_FLAG_TRACE_BEGIN)) {
+                            tb_idx = k;
+                            break;
+                        }
+                        if (frames[k].flags == 0x15 || (frames[k].flags & 0x17) == 0x15 ||
+                            frames[k].flags == 0x13 || (frames[k].flags & 0x17) == 0x13) {
+                            break;
+                        }
+                    }
+
+                    if (!had_entry_syscall_on_stack) {
+                        uint64_t start_time = (tb_idx >= 0) ? frames[tb_idx].timestamp
+                                                            : (has_trace_begin && last_trace_begin_time > 0 ? last_trace_begin_time : ele.timestamp);
+                        if (start_time > ele.timestamp) {
+                            start_time = ele.timestamp;
+                        }
+                        std::string sc_caller = !caller_sym_str.empty() && caller_sym_str != "[unknown]"
+                                                    ? caller_sym_str
+                                                    : (tb_idx >= 0 ? resolver.Resolve(frames[tb_idx].rank, frames[tb_idx].caller_sym) : "[unknown]");
+                        if (sc_caller.empty()) {
+                            sc_caller = "[unknown]";
+                        }
+
+                        LOG_DEBUG << "[TID " << tid << "] SYSCALL RET isolated (backtracked to 0x101): entry_SYSCALL_64"
+                                  << " (start_ts=" << start_time << ", end_ts=" << ele.timestamp
+                                  << ", dur=" << (ele.timestamp - start_time) << " ns)" << std::endl;
+
+                        out_events.push_back({TimelineEventType::FULL, ele.timestamp, start_time,
+                                              pidtid, "entry_SYSCALL_64", "[kernel.kallsyms]", sc_caller, ele.cpu});
+                        syscalls_count++;
+                    }
+                }
             } else if (ele.type == FrameType::CALL || (ele.flags & PERF_DLFILTER_FLAG_CALL)) {
                 bool from_trace_begin = after_trace_begin;
                 after_trace_begin     = false;
 
                 calls_count++;
                 sym_str = SanitizeSymbol(sym_str);
+
+                if ((ele.flags & 0x17) == 0x13 || ele.flags == 0x13) {
+                    if (sym_str.empty() || sym_str == "[unknown]" ||
+                        (sym_str.size() == 16 && sym_str.rfind("ffffffff", 0) == 0)) {
+                        sym_str = "entry_SYSCALL_64";
+                    }
+                    if (dso_str.empty()) {
+                        dso_str = "[kernel.kallsyms]";
+                    }
+                }
 
                 if (json_para.frameFrontSkipping) {
                     bool skip = false;
@@ -1161,6 +1364,9 @@ namespace {
                 // push the caller frame onto the stack first if it is not already present.
                 bool push_caller_first = from_trace_begin;
                 if (!push_caller_first && (ele.flags & 0x60) == 0x60 && stack.empty()) {
+                    push_caller_first = true;
+                }
+                if (!push_caller_first && ((ele.flags & 0x17) == 0x13 || ele.flags == 0x13) && stack.empty()) {
                     push_caller_first = true;
                 }
                 if (push_caller_first) {
@@ -1366,41 +1572,51 @@ namespace {
                         }
                     }
                 } else {
-                    int irq_idx = -1;
-                    for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
-                        if ((stack[i].flags & 0x60) == 0x60 ||
-                            (stack[i].flags & FLAG_INTERRUPT) == FLAG_INTERRUPT) {
-                            irq_idx = i;
-                            break;
+                    bool        is_0x101           = ((ele.flags & 0x101) == 0x101 || ele.flags == 0x101 ||
+                                                      (ele.flags & PERF_DLFILTER_FLAG_TRACE_BEGIN));
+                    std::string raw_caller         = resolver.Resolve(ele.rank, ele.caller_sym);
+                    bool        ip_or_caller_empty = (ele.ip == 0 || raw_caller.empty() || raw_caller == "[unknown]" ||
+                                                      caller_sym_str.empty() || caller_sym_str == "[unknown]");
+                    bool        callee_non_empty   = (!sym_str.empty() && sym_str != "[unknown]");
+
+                    if (is_0x101 && ip_or_caller_empty && callee_non_empty) {
+                        int sym_idx = -1;
+                        for (int i = static_cast<int>(stack.size()) - 1; i >= 0; --i) {
+                            if (stack[i].sym == sym_str || SanitizeSymbol(stack[i].sym) == sym_str) {
+                                sym_idx = i;
+                                break;
+                            }
                         }
-                    }
-                    if (irq_idx >= 0) {
-                        // Pop intermediate frames inside interrupt
-                        while (static_cast<int>(stack.size()) > irq_idx + 1) {
-                            auto child = stack.back();
-                            stack.pop_back();
-                            uint64_t end_time = ele.timestamp >= child.timestamp ? ele.timestamp : child.timestamp;
-                            recovered_ret_count++;
+                        if (sym_idx >= 0) {
+                            while (static_cast<int>(stack.size()) > sym_idx) {
+                                auto popped = stack.back();
+                                stack.pop_back();
 
-                            out_events.push_back({TimelineEventType::END, end_time, child.timestamp,
-                                                  pidtid, child.sym, child.dso, child.caller, ele.cpu});
+                                uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
+                                uint64_t dur      = end_time - popped.timestamp;
+
+                                if ((popped.flags & FLAG_INTERRUPT) == FLAG_INTERRUPT || (popped.flags & 0x60) == 0x60) {
+                                    interrupts_count++;
+                                    if (calls_count > 0) {
+                                        calls_count--;
+                                    }
+                                    std::string irq_sym = "[interrupt]";
+                                    if (popped.start_event_idx < out_events.size()) {
+                                        out_events[popped.start_event_idx].sym = irq_sym;
+                                    }
+                                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT: "
+                                              << irq_sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+                                    out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                                          pidtid, irq_sym, popped.dso, popped.caller, ele.cpu});
+                                } else {
+                                    trace_begin_pops_count++;
+                                    LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP TRACE_BEGIN: "
+                                              << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
+                                    out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
+                                                          pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
+                                }
+                            }
                         }
-
-                        auto popped = stack.back();
-                        stack.pop_back();
-
-                        interrupts_count++;
-                        if (calls_count > 0) {
-                            calls_count--;
-                        }
-                        uint64_t end_time = ele.timestamp >= popped.timestamp ? ele.timestamp : popped.timestamp;
-                        uint64_t dur      = end_time - popped.timestamp;
-
-                        LOG_DEBUG << "[TID " << tid << "][Depth " << stack.size() + 1 << "] --POP INTERRUPT (trace begin): "
-                                  << popped.sym << " (dur=" << dur << " ns, started at " << popped.timestamp << ")" << std::endl;
-
-                        out_events.push_back({TimelineEventType::END, end_time, popped.timestamp,
-                                              pidtid, popped.sym, popped.dso, popped.caller, ele.cpu});
                     }
                 }
             } else if (ele.type == FrameType::SYSCALL) {
