@@ -988,22 +988,24 @@ namespace {
         uint64_t last_seen_time = frames.back().timestamp;
         uint32_t tid            = static_cast<uint32_t>(pidtid & 0xFFFFFFFFULL);
 
-        uint64_t last_trace_begin_time  = 0;
-        bool     has_trace_begin        = false;
-        uint64_t calls_count            = 0;
-        uint64_t rets_count             = 0;
-        uint64_t exact_match_count      = 0;
-        uint64_t deep_match_count       = 0;
-        uint64_t missing_call_count     = 0;
-        uint64_t fallback_match_count   = 0;
-        uint64_t recovered_ret_count    = 0;
-        uint64_t empty_rets_count       = 0;
-        uint64_t syscalls_count         = 0;
-        uint64_t interrupts_count       = 0;
-        uint64_t trace_begin_pops_count = 0;
-        uint64_t tail_pops_count        = 0;
-        size_t   max_depth              = 0;
-        uint64_t local_count            = 0;
+        uint64_t    last_trace_begin_time = 0;
+        bool        has_trace_begin       = false;
+        bool        after_trace_begin     = false;
+        std::string last_trace_begin_dso;
+        uint64_t    calls_count            = 0;
+        uint64_t    rets_count             = 0;
+        uint64_t    exact_match_count      = 0;
+        uint64_t    deep_match_count       = 0;
+        uint64_t    missing_call_count     = 0;
+        uint64_t    fallback_match_count   = 0;
+        uint64_t    recovered_ret_count    = 0;
+        uint64_t    empty_rets_count       = 0;
+        uint64_t    syscalls_count         = 0;
+        uint64_t    interrupts_count       = 0;
+        uint64_t    trace_begin_pops_count = 0;
+        uint64_t    tail_pops_count        = 0;
+        size_t      max_depth              = 0;
+        uint64_t    local_count            = 0;
 
         for (size_t frame_idx = 0; frame_idx < frames.size(); ++frame_idx) {
             const auto &ele            = frames[frame_idx];
@@ -1036,12 +1038,20 @@ namespace {
                 std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.addr));
                 caller_sym_str = buf;
             }
+            if (caller_sym_str.empty() && ele.ip) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(ele.ip));
+                caller_sym_str = buf;
+            }
             if (sym_str.empty())
                 sym_str = "[unknown]";
             if (caller_sym_str.empty())
                 caller_sym_str = "[unknown]";
 
-            if (ele.type == FrameType::CALL) {
+            if (ele.type == FrameType::CALL || (ele.flags & PERF_DLFILTER_FLAG_CALL)) {
+                bool from_trace_begin = after_trace_begin;
+                after_trace_begin     = false;
+
                 calls_count++;
                 sym_str = SanitizeSymbol(sym_str);
 
@@ -1073,6 +1083,34 @@ namespace {
                     }
                 }
 
+                // If this is the first sample after TRACE_BEGIN and it is a CALL,
+                // push the caller frame onto the stack first if it is not already present.
+                if (from_trace_begin) {
+                    std::string caller_sym_sanitized = SanitizeSymbol(caller_sym_str);
+                    if (!caller_sym_sanitized.empty() && (caller_sym_sanitized != "[unknown]" || ele.ip != 0)) {
+                        if (stack.empty() || stack.back().sym != caller_sym_sanitized) {
+                            uint64_t    caller_ts  = (has_trace_begin && last_trace_begin_time > 0 && last_trace_begin_time <= ele.timestamp)
+                                                         ? last_trace_begin_time
+                                                         : ele.timestamp;
+                            std::string caller_dso = !last_trace_begin_dso.empty() ? last_trace_begin_dso : dso_str;
+
+                            size_t caller_start_event_idx = out_events.size();
+                            stack.push_back({caller_ts, ele.ip, 0, caller_sym_sanitized, caller_dso, "",
+                                             PERF_DLFILTER_FLAG_CALL, caller_start_event_idx});
+                            if (stack.size() > max_depth)
+                                max_depth = stack.size();
+
+                            calls_count++;
+
+                            LOG_DEBUG << "[TID " << tid << "] ++PUSH CALL (trace_begin caller): " << caller_sym_sanitized
+                                      << " (ts=" << caller_ts << ", dso=" << caller_dso << ")" << std::endl;
+
+                            out_events.push_back({TimelineEventType::START, caller_ts, 0, pidtid,
+                                                  caller_sym_sanitized, caller_dso, "", ele.cpu});
+                        }
+                    }
+                }
+
                 //
                 // TODO: Add support of JIT
                 // JIT
@@ -1092,6 +1130,7 @@ namespace {
 
                 out_events.push_back({TimelineEventType::START, ele.timestamp, 0, pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
             } else if (ele.type == FrameType::RETURN) {
+                after_trace_begin = false;
                 rets_count++;
                 sym_str = SanitizeSymbol(sym_str);
 
@@ -1210,6 +1249,8 @@ namespace {
                        (ele.flags & PERF_DLFILTER_FLAG_TRACE_BEGIN)) {
                 last_trace_begin_time             = ele.timestamp;
                 has_trace_begin                   = true;
+                after_trace_begin                 = true;
+                last_trace_begin_dso              = dso_str;
                 constexpr uint32_t FLAG_INTERRUPT = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL |
                                                     PERF_DLFILTER_FLAG_ASYNC | PERF_DLFILTER_FLAG_INTERRUPT; // 0x63
                 if (json_para.closeStackOnTraceBegin) {
@@ -1274,6 +1315,7 @@ namespace {
                     }
                 }
             } else if (ele.type == FrameType::SYSCALL) {
+                after_trace_begin = false;
                 syscalls_count++;
                 uint64_t end_time = ele.duration > 0 ? (ele.timestamp + ele.duration) : (ele.timestamp + 100);
 
@@ -1282,6 +1324,8 @@ namespace {
 
                 out_events.push_back({TimelineEventType::FULL, end_time, ele.timestamp,
                                       pidtid, sym_str, dso_str, caller_sym_str, ele.cpu});
+            } else {
+                after_trace_begin = false;
             }
         }
 

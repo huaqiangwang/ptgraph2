@@ -255,6 +255,100 @@ int main()
         PtGraphReader::UnlinkAll(tb_prefix);
     }
 
+    // 4. Test TRACE_BEGIN followed by CALL sample pushes caller and callee
+    // Sequence:
+    //   2258 [0x101] Addr _dl_start (TRACE_BEGIN)
+    //   2259 [0x63]  IP _dl_start, Addr asm_exc_page_fault (CALL / INTERRUPT) -> pushes _dl_start first, then asm_exc_page_fault
+    //   2260 [0x3]   IP asm_exc_page_fault, Addr error_entry (CALL) -> pushes error_entry on top of asm_exc_page_fault
+    //   2261 [0x5]   IP error_entry, Addr asm_exc_page_fault (RETURN) -> pops error_entry
+    //   2262 [0x5]   IP asm_exc_page_fault, Addr _dl_start (RETURN) -> pops asm_exc_page_fault
+    //   2263 [0x5]   IP _dl_start, Addr _start (RETURN) -> pops _dl_start
+    {
+        const std::string tb_prefix = "ptgraph_test_tb_call_" + std::to_string(getpid());
+        PtGraphReader::UnlinkAll(tb_prefix);
+        {
+            GraphDrawer drawer(nullptr, tb_prefix, 32, 1024, 4);
+
+            // Frame 0 (2258): TRACE_BEGIN at timestamp 1000, Addr = _dl_start
+            FrameEle fe_tb{};
+            fe_tb.timestamp = 1000;
+            fe_tb.pid       = 100;
+            fe_tb.tid       = 57955;
+            fe_tb.type      = FrameType::TRACE_BEGIN;
+            fe_tb.flags     = PERF_DLFILTER_FLAG_TRACE_BEGIN | PERF_DLFILTER_FLAG_BRANCH; // 0x101
+            drawer.AppendFrameWithSymbols(fe_tb, "_dl_start", "", "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2");
+
+            // Frame 1 (2259): First sample after TRACE_BEGIN with CALL flag (0x63)
+            FrameEle fe_call1{};
+            fe_call1.timestamp = 2000;
+            fe_call1.pid       = 100;
+            fe_call1.tid       = 57955;
+            fe_call1.type      = FrameType::CALL;
+            fe_call1.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL | PERF_DLFILTER_FLAG_ASYNC | PERF_DLFILTER_FLAG_INTERRUPT; // 0x63
+            fe_call1.ip        = 0x7fff0001;
+            fe_call1.addr      = 0xffff0002;
+            drawer.AppendFrameWithSymbols(fe_call1, "asm_exc_page_fault", "_dl_start", "[kernel.kallsyms]");
+
+            // Frame 2 (2260): CALL error_entry from asm_exc_page_fault (flags 0x3)
+            FrameEle fe_call2{};
+            fe_call2.timestamp = 2500;
+            fe_call2.pid       = 100;
+            fe_call2.tid       = 57955;
+            fe_call2.type      = FrameType::CALL;
+            fe_call2.flags     = PERF_DLFILTER_FLAG_BRANCH | PERF_DLFILTER_FLAG_CALL; // 0x3
+            fe_call2.ip        = 0xffff0002;
+            fe_call2.addr      = 0xffff0010;
+            drawer.AppendFrameWithSymbols(fe_call2, "error_entry", "asm_exc_page_fault", "[kernel.kallsyms]");
+
+            // Frame 3 (2261): RETURN for error_entry at timestamp 3000
+            FrameEle fe_ret1{};
+            fe_ret1.timestamp = 3000;
+            fe_ret1.pid       = 100;
+            fe_ret1.tid       = 57955;
+            fe_ret1.type      = FrameType::RETURN;
+            fe_ret1.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret1.ip        = 0xffff0010;
+            fe_ret1.addr      = 0xffff0002;
+            drawer.AppendFrameWithSymbols(fe_ret1, "error_entry", "asm_exc_page_fault", "[kernel.kallsyms]");
+
+            // Frame 4 (2262): RETURN for asm_exc_page_fault at timestamp 3500
+            FrameEle fe_ret2{};
+            fe_ret2.timestamp = 3500;
+            fe_ret2.pid       = 100;
+            fe_ret2.tid       = 57955;
+            fe_ret2.type      = FrameType::RETURN;
+            fe_ret2.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret2.ip        = 0xffff0002;
+            fe_ret2.addr      = 0x7fff0001;
+            drawer.AppendFrameWithSymbols(fe_ret2, "asm_exc_page_fault", "_dl_start", "[kernel.kallsyms]");
+
+            // Frame 5 (2263): RETURN for _dl_start at timestamp 4000
+            FrameEle fe_ret3{};
+            fe_ret3.timestamp = 4000;
+            fe_ret3.pid       = 100;
+            fe_ret3.tid       = 57955;
+            fe_ret3.type      = FrameType::RETURN;
+            fe_ret3.flags     = PERF_DLFILTER_FLAG_RETURN | PERF_DLFILTER_FLAG_BRANCH;
+            fe_ret3.ip        = 0x7fff0001;
+            fe_ret3.addr      = 0x7fff0000;
+            drawer.AppendFrameWithSymbols(fe_ret3, "_dl_start", "_start", "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2");
+
+            drawer.Finish();
+
+            std::string out_ftf = "/tmp/test_tb_call.ftf";
+            drawer.GenerateGraph(out_ftf);
+
+            // Verify the generated trace file exists
+            std::ifstream ftf(out_ftf, std::ios::binary);
+            assert(ftf.is_open());
+            ftf.close();
+            std::remove(out_ftf.c_str());
+            std::string gz_ftf = out_ftf + ".gz";
+            std::remove(gz_ftf.c_str());
+        }
+        PtGraphReader::UnlinkAll(tb_prefix);
+    }
+
     std::cout << "[TEST JSON] All JSON tests passed successfully!" << std::endl;
     return 0;
 }
