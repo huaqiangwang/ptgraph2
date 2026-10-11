@@ -267,8 +267,7 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         return;
     }
     total_samples_++;
-    LOG_TRACE << "[TID" << sample->tid << "] DlFilter: TS" << sample->time << std::hex
-              << sample->flags << std::dec;
+    LOG_TRACE << "[TID" << sample->tid << "] DlFilter: TS " << sample->time;
 
     void *active_ctx = ctx ? ctx : ctx_;
 
@@ -1086,6 +1085,16 @@ namespace {
             } else if (ele.type == FrameType::RETURN) {
                 rets_count++;
                 sym_str = SanitizeSymbol(sym_str);
+
+                // Handle special return frames, such as __x86_return_thunk
+                if (sym_str == "__x86_return_thunk" && stack.size() > 0) {
+                    // __x86_return_thunk repalces 'ret' instruction of last 'call'
+                    sym_str = stack.back().sym;
+                }
+                if (sym_str == "its_return_thunk" && stack.size() > 0) {
+                    // its_return_thunk repalces 'ret' instruction of last 'call'
+                    sym_str = stack.back().sym;
+                }
 
                 if (json_para.endFramePair) {
                     for (const auto &p : *json_para.endFramePair) {
