@@ -109,7 +109,12 @@ int filter_event(void *raw_state, const struct perf_dlfilter_sample *sample, voi
     // Add perf_dlfilter_sample into Frame / SHM.
     // If the active SHM zone capacity (frame queue or string pool) is full,
     // GraphDrawer will automatically append another SHM zone.
-    drawer->AddSample(sample, ctx);
+    try {
+        drawer->AddSample(sample, ctx);
+    } catch (const std::exception &e) {
+        LOG_ERROR << "Exception while adding sample: " << e.what() << std::endl;
+        return 0;
+    }
 
     return 1;
 }

@@ -279,10 +279,20 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     ele.timestamp = sample->time;
     ele.duration  = 0;
     ele.pid       = sample->pid >= 0 ? static_cast<uint32_t>(sample->pid) : 0;
-    ele.tid       = sample->tid >= 0 ? static_cast<uint32_t>(sample->tid) : 0;
     ele.rank      = static_cast<uint32_t>(proc_rank_);
     ele.cpu       = sample->cpu >= 0 ? static_cast<uint16_t>(sample->cpu) : 0;
     ele.flags     = sample->flags;
+
+    uint32_t tid = sample->tid >= 0 ? static_cast<uint32_t>(sample->tid) : 0;
+#define MAX_CPU 2048
+#define MAX_TID static_cast<uint32_t>(-1 - MAX_CPU)
+    if (tid > MAX_TID){
+        LOG_WARNING << "TID " << tid << " exceeds MAX_TID " << MAX_TID << std::endl;
+    }
+    if (tid == 0) {
+        tid = 0 - ele.cpu;
+    }
+    ele.tid = tid;
 
     // Determine FrameType from sample flags
     if (sample->flags & PERF_DLFILTER_FLAG_TRACE_BEGIN) {
