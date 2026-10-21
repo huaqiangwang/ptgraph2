@@ -133,6 +133,7 @@ void GraphDrawer::LoadConfig(const std::string &conf_file)
     if (close_stack_on_trace_begin_) {
         json_para_.closeStackOnTraceBegin = true;
     }
+    json_para_.Dump();
 
     // Only compute from json_para_.timeZone if ts_rank_begin_ns_/ts_rank_end_ns_ were not explicitly set via -b/-e
     if (ts_rank_begin_ns_ == 0 && ts_rank_end_ns_ == 0 && json_para_.timeZone) {
@@ -410,32 +411,6 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
         }
     }
 
-    LOG_TRACE << ", IP " << ip_sym << ", Addr " << addr_sym << ", DSO " << dso_str << ", flags 0x"
-              << std::hex << sample->flags << std::dec << std::endl;
-
-    // Check funcZone filtering
-    if (json_para_.funcZone) {
-        if (json_para_.funcZone->IsEnoughAccumulatedFunctions()) {
-            return;
-        }
-        uint32_t tid          = ele.tid;
-        bool     in_capturing = json_para_.funcZone->IsInCapturing(tid);
-        if (!in_capturing) {
-            if (json_para_.funcZone->IsMatchBeginFunction(sym_str, caller_sym_str, sample->flags, tid)) {
-                if (!json_para_.funcZone->CapturedEnoughFunctions(tid)) {
-                    in_capturing = true;
-                    json_para_.funcZone->SetCapturing(tid);
-                }
-            }
-        }
-        if (!in_capturing) {
-            return;
-        }
-        if (in_capturing && json_para_.funcZone->IsMatchEndFunction(sym_str, caller_sym_str, sample->flags, tid)) {
-            json_para_.funcZone->ClearCapturing(tid);
-        }
-    }
-
     // Check frame skipping
     if (json_para_.frameFrontSkipping && (sample->flags & PERF_DLFILTER_FLAG_CALL)) {
         for (const auto &skip_rule : *json_para_.frameFrontSkipping) {
@@ -454,27 +429,60 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
     }
 
     // Check frame modification
-    if (json_para_.frameFrontModification && (sample->flags & PERF_DLFILTER_FLAG_CALL)) {
-        for (const auto &pair : *json_para_.frameFrontModification) {
-            if (pair && pair->first && pair->first->Match(sym_str, dso_str, sample->ip, sample->addr)) {
-                if (pair->second) {
-                    if (pair->second->sym && !pair->second->sym->empty())
-                        sym_str = *pair->second->sym;
-                    if (pair->second->dso && !pair->second->dso->empty())
-                        dso_str = *pair->second->dso;
+    if (sample->flags & PERF_DLFILTER_FLAG_CALL) {
+        if (json_para_.frameFrontModification) {
+            for (const auto &pair : *json_para_.frameFrontModification) {
+                if (pair && pair->first && pair->first->Match(sym_str, dso_str, sample->ip, sample->addr)) {
+                    if (pair->second) {
+                        if (pair->second->sym && !pair->second->sym->empty())
+                            sym_str = *pair->second->sym;
+                        if (pair->second->dso && !pair->second->dso->empty())
+                            dso_str = *pair->second->dso;
+                    }
+                }
+            }
+        }
+
+        // Check funcZone filtering
+        if (json_para_.funcZone) {
+            uint32_t tid          = ele.tid;
+            bool     in_capturing = json_para_.funcZone->IsInCapturing(tid);
+            if (!in_capturing) {
+                if (json_para_.funcZone->IsMatchBeginFunction(sym_str, caller_sym_str, sample->flags, tid)) {
+                    LOG_DEBUG << "Matched begin function: " << sym_str << std::endl;
+                    if (!json_para_.funcZone->CapturedEnoughFunctions(tid)) {
+                        json_para_.funcZone->SetCapturing(tid);
+                        LOG_DEBUG << "Start capturing function: " << sym_str << std::endl;
+                    }
                 }
             }
         }
     }
-    if (json_para_.frameEndModification && (sample->flags & PERF_DLFILTER_FLAG_RETURN)) {
-        for (const auto &pair : *json_para_.frameEndModification) {
-            if (pair && pair->first && pair->first->Match(sym_str, dso_str, sample->ip, sample->addr)) {
-                if (pair->second) {
-                    if (pair->second->sym && !pair->second->sym->empty())
-                        sym_str = *pair->second->sym;
-                    if (pair->second->dso && !pair->second->dso->empty())
-                        dso_str = *pair->second->dso;
+
+    if (json_para_.funcZone && !json_para_.funcZone->IsInCapturing(ele.tid)) {
+        return;
+    }
+
+    if (sample->flags & PERF_DLFILTER_FLAG_RETURN) {
+        if (json_para_.frameEndModification) {
+            for (const auto &pair : *json_para_.frameEndModification) {
+                if (pair && pair->first && pair->first->Match(sym_str, dso_str, sample->ip, sample->addr)) {
+                    if (pair->second) {
+                        if (pair->second->sym && !pair->second->sym->empty())
+                            sym_str = *pair->second->sym;
+                        if (pair->second->dso && !pair->second->dso->empty())
+                            dso_str = *pair->second->dso;
+                    }
                 }
+            }
+        }
+
+        // Check funcZone filtering
+        if (json_para_.funcZone) {
+            uint32_t tid = ele.tid;
+            if (json_para_.funcZone->IsMatchEndFunction(caller_sym_str, sym_str, sample->flags, tid)) {
+                LOG_DEBUG << "Matched end function: " << sym_str << std::endl;
+                json_para_.funcZone->ClearCapturing(tid);
             }
         }
     }
@@ -487,6 +495,9 @@ void GraphDrawer::AddSample(const struct perf_dlfilter_sample *sample, void *ctx
             }
         }
     }
+
+    LOG_TRACE << ", IP " << ip_sym << ", Addr " << addr_sym << ", DSO " << dso_str << ", flags 0x"
+              << std::hex << sample->flags << std::dec << std::endl;
 
     AppendFrameWithSymbols(ele, sym_str, caller_sym_str, dso_str);
 

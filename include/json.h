@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -78,6 +79,39 @@ struct FramePattern
             return false;
         return true;
     }
+
+    std::string to_string() const
+    {
+        std::string result = "FramePattern: ";
+        bool        first  = true;
+        auto        append = [&](const std::string &k, const std::string &v) {
+            if (!first)
+                result += ", ";
+            result += k + ": " + v;
+            first = false;
+        };
+        if (timestamp != 0)
+            append("timestamp", std::to_string(timestamp));
+        if (pidtid != 0)
+            append("pidtid", std::to_string(pidtid));
+        if (dso)
+            append("dso", *dso);
+        if (sym)
+            append("sym", *sym);
+        if (caller)
+            append("caller", *caller);
+        if (ip != 0)
+            append("ip", std::to_string(ip));
+        if (addr != 0)
+            append("addr", std::to_string(addr));
+        if (tstart != 0)
+            append("tstart", std::to_string(tstart));
+        if (!type.empty())
+            append("type", type);
+        if (first)
+            result += "empty";
+        return result;
+    }
 };
 
 using FrontFrame = FramePattern;
@@ -113,7 +147,7 @@ struct JsonPara
             return equal(t, c, flag, thread);
         }
 
-        std::string toString() const
+        std::string to_string() const
         {
             return "currentSym: " + currentSym + ", targetIP: " + targetIP +
                    ", flags: " + std::to_string(flags) + ", tid: " + std::to_string(tid);
@@ -205,13 +239,16 @@ struct JsonPara
             return (repeataccumulated > 0 && capturedaccumulated >= repeataccumulated);
         }
 
-        std::string toString() const
+        std::string to_string() const
         {
-            std::string result = "FuncZone: repeat: " + std::to_string(repeat) + "\n";
+            std::string result = "FuncZone: repeat: " + std::to_string(repeat);
+            if (repeataccumulated > 0)
+                result += ", repeataccumulated: " + std::to_string(repeataccumulated);
+            result += "\n";
             if (begin)
-                result += "Begin: " + begin->toString() + "\n";
+                result += "Begin: " + begin->to_string() + "\n";
             if (end)
-                result += "End: " + end->toString() + "\n";
+                result += "End: " + end->to_string() + "\n";
             return result;
         }
 
@@ -238,7 +275,7 @@ struct JsonPara
             return true;
         }
 
-        std::string toString() const
+        std::string to_string() const
         {
             return "TimeZone: begin: " + std::to_string(begin) + ", end: " + std::to_string(end);
         }
@@ -261,7 +298,7 @@ struct JsonPara
             return true;
         }
 
-        std::string toString() const
+        std::string to_string() const
         {
             return "FrameZone: begin: " + std::to_string(begin) + ", count: " + std::to_string(count);
         }
@@ -273,6 +310,13 @@ struct JsonPara
         std::shared_ptr<std::string> got;
         std::shared_ptr<std::string> wanted;
         std::shared_ptr<std::string> replace;
+
+        std::string to_string() const
+        {
+            return "EndFramePair: got: " + (got ? *got : "null") +
+                   ", wanted: " + (wanted ? *wanted : "null") +
+                   ", replace: " + (replace ? *replace : "null");
+        }
     };
     std::shared_ptr<std::vector<std::shared_ptr<EndFramePair>>> endFramePair;
 
@@ -577,6 +621,83 @@ struct JsonPara
         debugLevel             = LogLevel::INFO;
         Logger::SetLevel(LogLevel::INFO);
     }
+
+    void Dump(std::ostream &os = std::cout) const
+    {
+        if (funcZone) {
+            os << funcZone->to_string();
+            if (funcZone->to_string().empty() || funcZone->to_string().back() != '\n')
+                os << "\n";
+        }
+        if (timeZone) {
+            os << timeZone->to_string() << "\n";
+        }
+        if (frameZone) {
+            os << frameZone->to_string() << "\n";
+        }
+        if (frameFrontModification) {
+            os << "frameFrontModification:\n";
+            for (size_t i = 0; i < frameFrontModification->size(); ++i) {
+                const auto &pair = (*frameFrontModification)[i];
+                if (pair) {
+                    os << "  match: " << (pair->first ? pair->first->to_string() : "null")
+                       << ", replace: " << (pair->second ? pair->second->to_string() : "null") << "\n";
+                }
+            }
+        }
+        if (frameEndModification) {
+            os << "frameEndModification:\n";
+            for (size_t i = 0; i < frameEndModification->size(); ++i) {
+                const auto &pair = (*frameEndModification)[i];
+                if (pair) {
+                    os << "  match: " << (pair->first ? pair->first->to_string() : "null")
+                       << ", replace: " << (pair->second ? pair->second->to_string() : "null") << "\n";
+                }
+            }
+        }
+        if (endFramePair) {
+            os << "endFramePair:\n";
+            for (size_t i = 0; i < endFramePair->size(); ++i) {
+                const auto &pair = (*endFramePair)[i];
+                if (pair) {
+                    os << "  " << pair->to_string() << "\n";
+                }
+            }
+        }
+        if (frameFrontSkipping) {
+            os << "frameFrontSkipping:\n";
+            for (size_t i = 0; i < frameFrontSkipping->size(); ++i) {
+                const auto &frame = (*frameFrontSkipping)[i];
+                if (frame) {
+                    os << "  " << frame->to_string() << "\n";
+                }
+            }
+        }
+        if (frameEndSkipping) {
+            os << "frameEndSkipping:\n";
+            for (size_t i = 0; i < frameEndSkipping->size(); ++i) {
+                const auto &frame = (*frameEndSkipping)[i];
+                if (frame) {
+                    os << "  " << frame->to_string() << "\n";
+                }
+            }
+        }
+        os << "perTidOutput: " << (perTidOutput ? "true" : "false") << "\n";
+        os << "closeStackOnTraceBegin: " << (closeStackOnTraceBegin ? "true" : "false") << "\n";
+        os << "debugLevel: " << Logger::LevelToString(debugLevel) << "\n";
+    }
+
+    std::string to_string() const
+    {
+        std::ostringstream oss;
+        Dump(oss);
+        return oss.str();
+    }
 };
+
+inline std::string to_string(const JsonPara &p)
+{
+    return p.to_string();
+}
 
 #endif // PTGRAPH2_JSON_H

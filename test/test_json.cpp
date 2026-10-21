@@ -162,6 +162,33 @@ int main()
     para.funcZone->ClearCapturing(tid);
     assert(para.funcZone->CapturedEnoughFunctions(tid)); // repeat reached (2)
 
+    // Test Dump() and to_string()
+    std::ostringstream dump_out;
+    para.Dump(dump_out);
+    std::string dump_str = dump_out.str();
+    assert(dump_str.find("FuncZone: repeat: 2") != std::string::npos);
+    assert(dump_str.find("TimeZone: begin: 1000000, end: 5000000") != std::string::npos);
+    assert(dump_str.find("FrameZone: begin: 10, count: 50") != std::string::npos);
+    assert(dump_str.find("frameFrontModification:") != std::string::npos);
+    assert(dump_str.find("endFramePair:") != std::string::npos);
+    assert(dump_str.find("frameFrontSkipping:") != std::string::npos);
+    assert(dump_str.find("frameEndSkipping:") != std::string::npos);
+    assert(dump_str.find("perTidOutput: false") != std::string::npos);
+    assert(dump_str.find("closeStackOnTraceBegin: false") != std::string::npos);
+    assert(dump_str.find("debugLevel: debug") != std::string::npos);
+    assert(para.to_string() == dump_str);
+
+    // Verify empty/cleared JsonPara Dump() shows only non-null elements
+    JsonPara           empty_para;
+    std::ostringstream empty_out;
+    empty_para.Dump(empty_out);
+    std::string empty_str = empty_out.str();
+    assert(empty_str.find("FuncZone") == std::string::npos);
+    assert(empty_str.find("TimeZone") == std::string::npos);
+    assert(empty_str.find("FrameZone") == std::string::npos);
+    assert(empty_str.find("frameFrontModification") == std::string::npos);
+    assert(empty_str.find("perTidOutput: false") != std::string::npos);
+
     // Test Integration with GraphDrawer
     const std::string prefix = "ptgraph_test_json_" + std::to_string(getpid());
     PtGraphReader::UnlinkAll(prefix);

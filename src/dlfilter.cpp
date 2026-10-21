@@ -76,15 +76,15 @@ int filter_event_early(void *raw_state, const struct perf_dlfilter_sample *sampl
 
     drawer->IncEarlySamples();
 
-    auto ret = drawer->FilterByTimestamp(sample->time);
-    if (ret != 0) {
-        return ret;
-    }
-
     static uint64_t next_process_hint_time = 0;
     if (sample->time > next_process_hint_time) {
         std::cout << "[PID " << getpid() << "] Processing ts: " << sample->time << std::endl;
         next_process_hint_time = sample->time + 10000000;
+    }
+
+    auto ret = drawer->FilterByTimestamp(sample->time);
+    if (ret != 0) {
+        return ret;
     }
 
     const auto &para = drawer->GetJsonPara();
